@@ -37,8 +37,8 @@ QUALITY = {
 DEFAULT_STATE = {"state": "idle", "quality": "draft", "motorsLocked": False}
 
 
-#def log(*a):
-#    print(*a, flush=True)
+def log(*a):
+    print(*a, flush=True)
 
 
 class Controller:
@@ -293,7 +293,7 @@ class Controller:
                     self._poweroff()
                 # everything else ignored at idle
             except serial.SerialException as e:
-                #log("serial error, reopening:", e)
+                log("serial error, reopening:", e)
                 try:
                     self.ser.close()
                 except Exception:
@@ -301,7 +301,7 @@ class Controller:
                 self._set(state="idle")
                 self._open_serial()
             except Exception as e:
-                #log("controller error (continuing):", e)
+                log("controller error (continuing):", e)
 
 
 def start_button(q):
@@ -348,7 +348,7 @@ def start_socket(q):
                     conn.sendall(b"err\n")
                 conn.close()
             except Exception as e:
-                #log("socket error:", e)
+                log("socket error:", e)
 
     threading.Thread(target=serve, daemon=True).start()
 
