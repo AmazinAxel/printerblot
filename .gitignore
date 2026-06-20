@@ -1,0 +1,21 @@
+# Test build artifacts
+*.o
+run_tests
+
+# platformio
+.pio/
+.pioenvs/
+.piolibdeps/
+.vscode/
+.clangd/
+compile_commands.json
+
+.claude
+
+# Runtime state (lives in /var/lib/blotd in prod, never committed)
+state.json
+lastJob.gcode
+lastUploadedPDF.*
+*.tmp
+__pycache__/
+*.pyc
