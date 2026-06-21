@@ -13,7 +13,6 @@
           # Runtime deps of buttonService.py (the GPIO/serial controller daemon).
           daemonPython = pkgs.python3.withPackages (ps: with ps; [
             pyserial
-            gpiozero
             lgpio
           ]);
 
@@ -28,7 +27,6 @@
             name = "blotd";
             runtimeInputs = [ daemonPython ];
             text = ''
-              export GPIOZERO_PIN_FACTORY=lgpio
               exec python3 ${self}/buttonService.py "$@"
             '';
           };

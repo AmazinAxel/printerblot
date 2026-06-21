@@ -1,4 +1,3 @@
-import { connect } from "node:net";
 import { existsSync, unlinkSync, renameSync } from "node:fs";
 
 const DATA_DIR = process.env.BLOT_DATA_DIR ?? "/var/lib/blotd"; // runtime state
@@ -9,14 +8,22 @@ const GCODE_FILE = `${DATA_DIR}/lastJob.gcode`;
 const PDF2GCODE = process.env.PDF2GCODE ?? "tools/pdf2gcode.py";
 const SOCKET_PATH = "/run/blot-socket/blot-socket.sock";
 
+// Send one verb to blotd over its unix socket; resolve with the reply.
+// Bun-native socket — no node:net shim. blotd replies then closes the conn.
 function daemon(verb: string): Promise<string> {
   return new Promise((resolve) => {
-    const sock = connect(SOCKET_PATH);
     let buf = "";
-    sock.on("connect", () => sock.write(verb + "\n"));
-    sock.on("data", (d) => { buf += d; sock.end(); });
-    sock.on("close", () => resolve(buf.trim() || "err"));
-    sock.on("error", () => resolve("err"));
+    let done = false;
+    const finish = (r: string) => { if (!done) { done = true; resolve(r); } };
+    Bun.connect({
+      unix: SOCKET_PATH,
+      socket: {
+        open: (s) => { s.write(verb + "\n"); },
+        data: (_s, d) => { buf += d.toString(); },
+        close: () => finish(buf.trim() || "err"),
+        error: () => finish("err"),
+      },
+    }).catch(() => finish("err"));
   });
 }
 
@@ -185,6 +192,6 @@ Bun.serve({
       const reply = await daemon(pathname.slice(1));
       return Response.json({ ok: reply === "ok" });
     }
-    //return new Response("not found", { status: 404 });
+    return new Response("not found", { status: 404 });
   }
 });

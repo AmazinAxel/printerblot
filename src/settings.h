@@ -2,13 +2,6 @@
 
 #include "config.h"
 
-// Persistent settings stored in flash-backed EEPROM emulation. Loaded once
-// at boot; saved every time a `$N=value` command updates a setting.
-//
-// The planner's tunables (planner_*) live in planner.cpp as globals; this
-// module owns the non-planner settables (work area, servo PWM) and the
-// load/save plumbing. See settings_load()/settings_save() for the field list.
-
 // Work area (physical envelope). Origin (0, 0) is bottom-left; +X right,
 // +Y up. Used for documentation today; when we add $20 soft-limits they
 // become hard bounds.

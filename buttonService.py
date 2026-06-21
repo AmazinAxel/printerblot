@@ -10,7 +10,7 @@ import time
 
 try:
     import serial
-    from gpiozero import Button
+    import lgpio
 except ImportError as e:
     sys.stderr.write(f"Missing dependency: {e}\n")
     sys.exit(1)
@@ -305,21 +305,35 @@ class Controller:
 
 
 def start_button(q):
-    btn = Button(BUTTON_PIN, pull_up=True, bounce_time=0.05, hold_time=HOLD_TIME)
-    held = {"v": False}
+    # Raw lgpio, not gpiozero: gpiozero refuses to start unless it can read a
+    # known Pi board revision from /proc/device-tree, which NixOS doesn't expose
+    # (PinUnknownPi). lgpio just opens the chip and claims the line. Button is
+    # BCM3 → GND with an internal pull-up, so pressed reads 0, released reads 1.
+    h = lgpio.gpiochip_open(0)
+    lgpio.gpio_claim_alert(h, BUTTON_PIN, lgpio.BOTH_EDGES, lgpio.SET_PULL_UP)
+    lgpio.gpio_set_debounce_micros(h, BUTTON_PIN, 50000)   # 50 ms debounce
 
-    def on_held():
-        held["v"] = True
+    st = {"timer": None, "held": False}
+
+    def fire_hold():
+        st["held"] = True
         q.put(("HOLD",))
 
-    def on_released():
-        if not held["v"]:
-            q.put(("PRESS",))
-        held["v"] = False
+    def on_edge(chip, gpio, level, tstamp):
+        # level: 0 = pressed, 1 = released, 2 = watchdog (ignored).
+        if level == 0:                                  # press: arm hold timer
+            st["held"] = False
+            st["timer"] = threading.Timer(HOLD_TIME, fire_hold)
+            st["timer"].daemon = True
+            st["timer"].start()
+        elif level == 1:                                # release
+            if st["timer"]:
+                st["timer"].cancel()
+            if not st["held"]:                          # short press
+                q.put(("PRESS",))
 
-    btn.when_held = on_held
-    btn.when_released = on_released
-    return btn # keep a reference alive
+    cb = lgpio.callback(h, BUTTON_PIN, lgpio.BOTH_EDGES, on_edge)
+    return (h, cb)   # keep both refs alive
 
 
 def start_socket(q):
