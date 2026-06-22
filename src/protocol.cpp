@@ -45,6 +45,17 @@ static void emit_welcome() {
     Serial.print(F("\r\nGrbl 1.1f ['$' for help]\r\n"));
 }
 
+// After a reset the stepper keeps its true motor position, but plan_reset()
+// zeroes the planner's step anchor. Re-anchor the planner (and the gcode
+// parser, which reads its position from the planner) to where the machine
+// physically is, so the next absolute move computes the correct delta instead
+// of driving from a phantom 0,0.
+static void sync_planner_to_machine() {
+    float sx, sy;
+    stepper_get_machine_position_mm(&sx, &sy);
+    plan_set_position(sx, sy);
+}
+
 void protocol_init() {
     Serial.begin(SERIAL_BAUD);
     uint32_t deadline = millis() + 800;
@@ -95,6 +106,7 @@ void protocol_service() {
                 stepper_reset();
                 plan_reset();
                 gcode_reset();
+                sync_planner_to_machine();
                 line_len = 0;
                 line_overflow = false;
                 emit_welcome();
@@ -104,6 +116,7 @@ void protocol_service() {
                 // GRBL's "decel and flush"; a pen plotter can stop abruptly.
                 stepper_reset();
                 plan_reset();
+                sync_planner_to_machine();
                 continue;
         }
 

@@ -28,7 +28,7 @@ BAUD        = 115200
 BUTTON_PIN  = 3
 HOLD_TIME   = 1.0
 
-RAPID_RATE  = 16000
+RETURN_RATE = 3000
 
 QUALITY = {
     "draft":  {"$110": 16000, "$120": 16000, "$140": 0.05, "$141": 0.004},
@@ -257,7 +257,7 @@ class Controller:
         mx, my = self._origin
         self._send_line("M5") # pen up
         self._send_line("G90")
-        self._send_line(f"G1 X{mx:.3f} Y{my:.3f} F{RAPID_RATE}")
+        self._send_line(f"G1 X{mx:.3f} Y{my:.3f} F{RETURN_RATE}")
         self._wait_idle()
         self._send_line("M18") # disable motors
         self._set(state="idle", motorsLocked=False)

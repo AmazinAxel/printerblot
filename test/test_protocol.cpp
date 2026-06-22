@@ -182,6 +182,31 @@ TEST_CASE("protocol: soft reset (0x18) flushes the planner and restores welcome"
     CHECK(st.find("Idle") != std::string::npos);   // stepper is idle again
 }
 
+TEST_CASE("protocol: soft reset re-anchors planner to true machine position") {
+    // A soft reset preserves the stepper's real motor position but resets the
+    // planner. Without re-anchoring, the next absolute move plans from a
+    // phantom 0,0 and drives off in the wrong direction. After the reset, an
+    // absolute move back to a known point must actually land there.
+    sim_reset();
+    sim_gcode("G21 G90 F600");
+    sim_gcode("G1 X5 Y5");        // print "origin"
+    sim_run_until_idle();
+    sim_gcode("G1 X20 Y10");      // motion during the job
+    sim_run_until_idle();
+
+    Serial.host_clear();
+    char rb[2] = {0x18, 0};
+    Serial.host_push_input(rb);
+    drain();                      // soft reset → flush + re-anchor
+
+    sim_gcode("G90 G1 X5 Y5 F600");   // return to origin
+    sim_run_until_idle();
+
+    float x, y; sim_get_cartesian_mm(&x, &y);
+    CHECK_NEAR(x, 5.0f, 0.05f);
+    CHECK_NEAR(y, 5.0f, 0.05f);
+}
+
 // ───── overflow & edge cases ─────
 
 TEST_CASE("protocol: overlong line emits error:OVERFLOW on next newline") {
