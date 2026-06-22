@@ -1,4 +1,4 @@
-import { existsSync, unlinkSync, renameSync } from "node:fs";
+import { existsSync, unlinkSync, renameSync, watch } from "node:fs";
 
 const DATA_DIR = process.env.BLOT_DATA_DIR ?? "/var/lib/blotd"; // runtime state
 const REPO = process.env.BLOT_REPO ?? "."; // printerblot source (Nix store in prod)
@@ -34,6 +34,27 @@ async function readState(): Promise<any> {
     return { state: "idle", quality: "draft", motorsLocked: false };
   }
 }
+
+// Server-Sent Events: push state to the browser only when state.json actually
+// changes, so the page needs no polling. blotd writes state.json atomically, so
+// watch the directory and react to the rename.
+const enc = new TextEncoder();
+const sseClients = new Set<ReadableStreamDefaultController>();
+let lastBroadcast = "";
+
+async function broadcastState() {
+  const s = JSON.stringify(await readState());
+  if (s === lastBroadcast) return;
+  lastBroadcast = s;
+  const chunk = enc.encode(`data: ${s}\n\n`);
+  for (const c of sseClients) {
+    try { c.enqueue(chunk); } catch {}
+  }
+}
+
+watch(DATA_DIR, (_event, filename) => {
+  if (filename === "state.json") broadcastState();
+});
 
 // Save the uploaded PDF and convert it to gcode with the form's settings.
 async function handleUpload(req: Request): Promise<Response> {
@@ -120,8 +141,7 @@ async function post(url, body) {
   return r.json().catch(() => ({}));
 }
 
-async function refresh() {
-  const s = await (await fetch("/state")).json();
+function render(s) {
   $("#status").textContent =
     s.state === "idle" ? "Not running" : s.state[0].toUpperCase()+s.state.slice(1);
 
@@ -137,9 +157,7 @@ async function refresh() {
       '<button id="bsleep">Sleep</button>' +
       '<button id="block">' + (s.motorsLocked ? "Unlock motors" : "Lock motors") + '</button>';
     $("#bsleep").onclick = async () => { await post("/sleep"); };
-    $("#block").onclick = async () => {
-      await post(s.motorsLocked ? "/unlock" : "/lock"); refresh();
-    };
+    $("#block").onclick = async () => { await post(s.motorsLocked ? "/unlock" : "/lock"); };
   } else {
     c.innerHTML = "";
   }
@@ -147,7 +165,7 @@ async function refresh() {
 
 for (const el of document.getElementsByName("q")) {
   el.addEventListener("change", async () => {
-    await post("/quality", new URLSearchParams({q: el.value})); refresh();
+    await post("/quality", new URLSearchParams({q: el.value}));
   });
 }
 
@@ -160,13 +178,14 @@ $("#up").addEventListener("submit", async (e) => {
   $("#upbtn").disabled = false;
 });
 
-refresh();
-setInterval(refresh, 2000);
+const es = new EventSource("/events");
+es.onmessage = (e) => render(JSON.parse(e.data));
 </script>
 </body></html>`;
 
 Bun.serve({
   port: 80,
+  idleTimeout: 255, // keep SSE connections (and long PDF conversions) alive
   async fetch(req) {
     const url = new URL(req.url);
     const { pathname } = url;
@@ -176,6 +195,30 @@ Bun.serve({
     }
     if (pathname === "/state" && req.method === "GET") {
       return Response.json(await readState());
+    }
+    if (pathname === "/events" && req.method === "GET") {
+      let controllerRef: ReadableStreamDefaultController;
+      let ping: ReturnType<typeof setInterval>;
+      const stream = new ReadableStream({
+        async start(controller) {
+          controllerRef = controller;
+          sseClients.add(controller);
+          controller.enqueue(enc.encode(`data: ${JSON.stringify(await readState())}\n\n`));
+          ping = setInterval(() => {
+            try { controller.enqueue(enc.encode(": ping\n\n")); } catch {}
+          }, 25000);
+        },
+        cancel() {
+          clearInterval(ping);
+          sseClients.delete(controllerRef);
+        },
+      });
+      return new Response(stream, {
+        headers: {
+          "content-type": "text/event-stream",
+          "cache-control": "no-cache",
+        },
+      });
     }
     if (pathname === "/upload" && req.method === "POST") {
       return handleUpload(req);

@@ -261,7 +261,7 @@ class Controller:
         self._wait_idle()
         self._send_line("M18") # disable motors
         self._set(state="idle", motorsLocked=False)
-        #log("stopped, returned to origin")
+        log("stopped, returned to origin")
 
     # ───── command resolution ─────
     def _resolve(self, cmd):
