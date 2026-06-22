@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import glob
 import json
 import os
 import queue
@@ -70,18 +71,38 @@ class Controller:
         ##log("state:", self.state)
 
     # ───── serial plumbing ─────
+    def _find_port(self):
+        ports = sorted(glob.glob("/dev/ttyACM*"))
+        return ports[0] if ports else SERIAL_PORT
+
     def _open_serial(self):
         while True:
+            port = self._find_port()
             try:
-                self.ser = serial.Serial(SERIAL_PORT, BAUD, timeout=0.5,
+                self.ser = serial.Serial(port, BAUD, timeout=0.5,
                                          dsrdtr=False, rtscts=False)
                 time.sleep(0.3)
                 self.ser.reset_input_buffer()
-                #og("serial open:", SERIAL_PORT)
+                log("serial open:", port)
                 return
-            except serial.SerialException as e:
-                #log("waiting for serial:", e)
+            except (serial.SerialException, OSError) as e:
+                log("waiting for serial:", e)
                 time.sleep(2)
+
+    def _init_firmware(self):
+        self._write(bytes([0x18]))
+        time.sleep(0.3)
+        self.ser.reset_input_buffer()
+        self._send_line("M18")
+        self._set(state="idle", motorsLocked=False)
+
+    def _reopen(self):
+        try:
+            self.ser.close()
+        except Exception:
+            pass
+        self._open_serial()
+        self._init_firmware()
 
     def _write(self, data: bytes):
         self.ser.write(data)
@@ -134,7 +155,7 @@ class Controller:
         self._set(motorsLocked=locked)
 
     def _poweroff(self):
-        #log("powering off")
+        log("powering off")
         self._save_state()
         subprocess.run(["systemctl", "poweroff"])
 
@@ -158,7 +179,7 @@ class Controller:
         self._origin = (mx, my)
         self._pen_down = False   # tracks the pen state the firmware is in now
         self._set(state="running")
-        #log(f"printing {len(lines)} lines, origin=({mx:.3f},{my:.3f})")
+        log(f"printing {len(lines)} lines, origin=({mx:.3f},{my:.3f})")
 
         i = 0
         while i < len(lines):
@@ -185,8 +206,9 @@ class Controller:
             i += 1
 
         self._wait_idle()
+        self._send_line("M18")
         self._set(state="idle", motorsLocked=False)
-        #log("print complete")
+        log("print complete")
 
     def _pause_loop(self):
         """Pause for an ink swap: drain to a clean stop, lift the pen, keep the
@@ -266,40 +288,38 @@ class Controller:
                 self._save_state()
             # other verbs are not valid mid-print
 
+    def _dispatch(self, cmd):
+        v = self._resolve(cmd)
+        st = self.state["state"]
+        if v == "START" and st == "idle":
+            self._run_print()
+        elif v == "POWEROFF" and st == "idle":
+            self._poweroff()
+        elif v == "QUALITY":
+            self._set(quality=cmd[1])
+        elif v == "LOCK" and st == "idle":
+            self._lock(True)
+        elif v == "UNLOCK" and st == "idle":
+            self._lock(False)
+        elif v == "SLEEP" and st == "idle":
+            self._poweroff()
+        # everything else ignored at idle
+
     def run(self):
         self._open_serial()
-        self._write(bytes([0x18])) # clean firmware state on boot
-        time.sleep(0.3)
-        self.ser.reset_input_buffer()
-        self._send_line("M18") # motors free on boot
-        self._set(state="idle", motorsLocked=False)
+        self._init_firmware()
 
         while True:
+            cmd = self.q.get()
             try:
-                cmd = self.q.get()
-                v = self._resolve(cmd)
-                st = self.state["state"]
-                if v == "START" and st == "idle":
-                    self._run_print()
-                elif v == "POWEROFF" and st == "idle":
-                    self._poweroff()
-                elif v == "QUALITY":
-                    self._set(quality=cmd[1])
-                elif v == "LOCK" and st == "idle":
-                    self._lock(True)
-                elif v == "UNLOCK" and st == "idle":
-                    self._lock(False)
-                elif v == "SLEEP" and st == "idle":
-                    self._poweroff()
-                # everything else ignored at idle
-            except serial.SerialException as e:
+                self._dispatch(cmd)
+            except (serial.SerialException, OSError) as e:
                 log("serial error, reopening:", e)
+                self._reopen()
                 try:
-                    self.ser.close()
-                except Exception:
-                    pass
-                self._set(state="idle")
-                self._open_serial()
+                    self._dispatch(cmd)
+                except (serial.SerialException, OSError) as e2:
+                    log("serial error after reopen, dropping command:", e2)
             except Exception as e:
                 log("controller error (continuing):", e)
 
@@ -317,6 +337,7 @@ def start_button(q):
 
     def fire_hold():
         st["held"] = True
+        log("button: hold")
         q.put(("HOLD",))
 
     def on_edge(chip, gpio, level, tstamp):
@@ -330,6 +351,7 @@ def start_button(q):
             if st["timer"]:
                 st["timer"].cancel()
             if not st["held"]:                          # short press
+                log("button: press")
                 q.put(("PRESS",))
 
     cb = lgpio.callback(h, BUTTON_PIN, lgpio.BOTH_EDGES, on_edge)

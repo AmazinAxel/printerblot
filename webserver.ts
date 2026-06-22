@@ -76,7 +76,7 @@ async function handleUpload(req: Request): Promise<Response> {
   }
   if (existsSync(GCODE_FILE)) unlinkSync(GCODE_FILE);
   renameSync(produced, GCODE_FILE);
-  return Response.json({ ok: true, log: out.trim() });
+  return Response.json({ ok: true });
 }
 
 const PAGE = `<!doctype html>
@@ -156,7 +156,7 @@ $("#up").addEventListener("submit", async (e) => {
   $("#upbtn").disabled = true;
   $("#uplog").textContent = "Converting to gcode...";
   const res = await post("/upload", new FormData($("#up")));
-  $("#uplog").textContent = res.ok ? "Done!\\n" + (res.log||"") : "Error: " + (res.error||"failed");
+  $("#uplog").textContent = res.ok ? "Done!" : "Error: " + (res.error||"failed");
   $("#upbtn").disabled = false;
 });
 
