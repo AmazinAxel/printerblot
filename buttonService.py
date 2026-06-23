@@ -23,6 +23,7 @@ HOLD_TIME = 0.5
 
 RETURN_RATE = 3000
 
+# TODO adjust these
 QUALITY = {
     "draft":  {"$110": 16000, "$120": 16000, "$140": 0.05, "$141": 0.004},
     "poster": {"$110": 4000,  "$120": 1000,  "$140": 0.01, "$141": 0.002},
@@ -30,10 +31,7 @@ QUALITY = {
 
 DEFAULT_STATE = {"state": "idle", "quality": "draft", "motorsLocked": False}
 
-
-#def log(*a):
-#    print(*a, flush=True)
-
+# all of the different actions you can do
 class Controller:
     def __init__(self):
         self.q = queue.Queue()
@@ -66,14 +64,12 @@ class Controller:
         while True:
             ports = sorted(glob.glob("/dev/ttyACM*"))
             if ports:
-                try:
-                    self.ser = serial.Serial(ports[0], BAUD, timeout=0.5, dsrdtr=False, rtscts=False)
-                    time.sleep(0.3)
-                    self.ser.reset_input_buffer()
-                    #log("serial open:", ports[0])
-                    return
-                except (serial.SerialException, OSError) as e:
-                    #log("waiting for serial:", e)
+#                try:
+                self.ser = serial.Serial(ports[0], BAUD, timeout=0.5, dsrdtr=False, rtscts=False)
+                time.sleep(0.3)
+                self.ser.reset_input_buffer()
+                return
+#                except (serial.SerialException, OSError) as e:
             time.sleep(2)
 
     def _init_firmware(self):
@@ -162,7 +158,6 @@ class Controller:
         self._origin = (mx, my)
         self._pen_down = False
         self._set(state="running")
-        #log(f"printing {len(lines)} lines, origin=({mx:.3f},{my:.3f})")
 
         i = 0
         while i < len(lines):
@@ -191,7 +186,6 @@ class Controller:
         self._wait_idle()
         self._send_line("M18")
         self._set(state="idle", motorsLocked=False)
-        #log("print complete")
 
     def _pause_loop(self):
         self._wait_idle() # finish buffer then stop
@@ -232,7 +226,6 @@ class Controller:
         self._wait_idle()
         self._send_line("M18") # disable motors
         self._set(state="idle", motorsLocked=False)
-        #log("stopped, returned to origin")
 
     # commands from the website
     def _resolve(self, cmd):
@@ -282,14 +275,11 @@ class Controller:
             try:
                 self._dispatch(cmd)
             except (serial.SerialException, OSError) as e:
-                #log("serial error, reopening:", e)
                 self._reopen()
-                try:
-                    self._dispatch(cmd)
-                except (serial.SerialException, OSError) as e2:
-                    #log("serial error after reopen, dropping command:", e2)
-            except Exception as e:
-                #log("controller error (continuing):", e)
+                #try:
+                self._dispatch(cmd)
+                #except (serial.SerialException, OSError) as e2:
+            #except Exception as e:
 
 ## ACTUAL BUTTON SERVICE
 
@@ -337,18 +327,17 @@ def start_socket(q):
 
     def serve():
         while True:
-            try:
-                conn, _ = srv.accept()
-                msg = conn.recv(64).decode(errors="replace").strip()
-                if msg in VERBS:
-                    q.put(VERBS[msg])
-                    conn.sendall(b"ok\n")
-                else:
-                    conn.sendall(b"err\n")
-                conn.close()
-            except Exception as e:
-                #log("socket error:", e)
-
+            #try:
+            conn, _ = srv.accept()
+            msg = conn.recv(64).decode(errors="replace").strip()
+            if msg in VERBS:
+                q.put(VERBS[msg])
+                conn.sendall(b"ok\n")
+            else:
+                conn.sendall(b"err\n")
+            conn.close()
+            #except Exception as e:
+            
     threading.Thread(target=serve, daemon=True).start()
 
 def main():

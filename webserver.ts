@@ -57,7 +57,7 @@ async function handleUpload(req: Request): Promise<Response> {
   const form = await req.formData();
   const file = form.get("pdf");
   if (!(file instanceof File) || file.size === 0) {
-    return Response.json({ ok: false, error: "no PDF supplied" }, { status: 400 });
+    return Response.json({ ok: false, error: "No PDF supplied" }, { status: 400 });
   }
 
   await Bun.write(PDF_FILE, file); // overwrites any previous upload
@@ -83,12 +83,12 @@ async function handleUpload(req: Request): Promise<Response> {
   ]);
 
   if (code !== 0) {
-    return Response.json({ ok: false, error: err || out || "conversion failed" });
+    return Response.json({ ok: false, error: err || out || "Conversion failed" });
   }
 
   const produced = Bun.file(`${DATA_DIR}/lastUploadedPDF.gcode`);
   if (!(await produced.exists()))
-    return Response.json({ ok: false, error: "no gcode produced\n" + out });
+    return Response.json({ ok: false, error: "No gcode produced\n" + out });
 
   await Bun.write(GCODE_FILE, produced); // move into place (overwrites)
   await produced.delete();

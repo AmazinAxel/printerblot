@@ -3,20 +3,18 @@
 
   outputs = { self, nixpkgs, ... }:
     let
-      systems = [ "x86_64-linux" "aarch64-linux" ];
-      forAllSystems = nixpkgs.lib.genAttrs systems;
+      system = "aarch64-linux";
+      pkgs = nixpkgs.legacyPackages.${system};
     in {
-      packages = forAllSystems (system:
+      packages.${system} =
         let
-          pkgs = nixpkgs.legacyPackages.${system};
-
-          # Runtime deps of buttonService.py (the GPIO/serial controller daemon).
+          # button service
           daemonPython = pkgs.python3.withPackages (ps: with ps; [
             pyserial
             lgpio
           ]);
 
-          # Runtime deps of tools/pdf2gcode.py (invoked by the web server).
+          # pdf2gcode
           toolPython = pkgs.python3.withPackages (ps: with ps; [
             numpy
             pillow
@@ -42,27 +40,6 @@
           };
 
           default = blotd;
-        });
-
-      devShells = forAllSystems (system:
-        let
-          pkgs = nixpkgs.legacyPackages.${system};
-          python = pkgs.python3.withPackages (ps: with ps; [
-            pyserial
-            prompt-toolkit
-            numpy
-            pillow
-            scikit-image
-          ]);
-        in {
-          default = pkgs.mkShell {
-            packages = [
-              python
-              pkgs.poppler-utils
-              pkgs.platformio
-              pkgs.gnumake
-            ];
-          };
-        });
+        };
     };
 }
