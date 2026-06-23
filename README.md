@@ -7,3 +7,7 @@ A modified version of [Sam's updated Blot firmware](https://github.com/samdev-7/
 Unlike the upstream firmware, you have to flash this with [PlatformIO](https://platformio.org/) instead of the Arduino IDE.
 
 Plug in your Blot and hold the B button on the Xiao (you only need to do this if this is the first flash), then run `pio run -t upload` and you're done! You can use the utilities in `tools/` to send raw gcode (through `term.py`), or turn a pdf to gcode (`pdf2gcode.py`) and stream that (`stream.py`). If you're on Nix, you can use the devshell: `nix develop`
+
+## On a Pi
+
+You can optionally hook up a button to a Pi (on header pins 5 and 6) and install the Nix flake ((Permablot host))[https://github.com/AmazinAxel/flake] so you don't need a laptop!

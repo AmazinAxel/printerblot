@@ -1,15 +1,14 @@
-import { existsSync, unlinkSync, renameSync, watch } from "node:fs";
+import { watch } from "fs"; // no Bun-native file watcher yet
 
-const DATA_DIR = process.env.BLOT_DATA_DIR ?? "/var/lib/blotd"; // runtime state
-const REPO = process.env.BLOT_REPO ?? "."; // printerblot source (Nix store in prod)
+const DATA_DIR = process.env.BLOT_DATA_DIR; // runtime state
+const REPO = process.env.BLOT_REPO; // printerblot source
 const STATE_FILE = `${DATA_DIR}/state.json`;
 const PDF_FILE = `${DATA_DIR}/lastUploadedPDF.pdf`;
 const GCODE_FILE = `${DATA_DIR}/lastJob.gcode`;
-const PDF2GCODE = process.env.PDF2GCODE ?? "tools/pdf2gcode.py";
+const PDF2GCODE = process.env.PDF2GCODE;
 const SOCKET_PATH = "/run/blot-socket/blot-socket.sock";
 
-// Send one verb to blotd over its unix socket; resolve with the reply.
-// Bun-native socket — no node:net shim. blotd replies then closes the conn.
+// connects with blotd
 function daemon(verb: string): Promise<string> {
   return new Promise((resolve) => {
     let buf = "";
@@ -31,13 +30,11 @@ async function readState(): Promise<any> {
   try {
     return await Bun.file(STATE_FILE).json();
   } catch {
-    return { state: "idle", quality: "draft", motorsLocked: false };
-  }
-}
+    return { state: "idle", quality: "draft", motorsLocked: true }; // default values if the file is not created yet, for new installs
+  };
+};
 
-// Server-Sent Events: push state to the browser only when state.json actually
-// changes, so the page needs no polling. blotd writes state.json atomically, so
-// watch the directory and react to the rename.
+// automatic page updates!
 const enc = new TextEncoder();
 const sseClients = new Set<ReadableStreamDefaultController>();
 let lastBroadcast = "";
@@ -49,14 +46,13 @@ async function broadcastState() {
   const chunk = enc.encode(`data: ${s}\n\n`);
   for (const c of sseClients) {
     try { c.enqueue(chunk); } catch {}
-  }
-}
+  };
+};
 
 watch(DATA_DIR, (_event, filename) => {
   if (filename === "state.json") broadcastState();
 });
 
-// Save the uploaded PDF and convert it to gcode with the form's settings.
 async function handleUpload(req: Request): Promise<Response> {
   const form = await req.formData();
   const file = form.get("pdf");
@@ -64,8 +60,7 @@ async function handleUpload(req: Request): Promise<Response> {
     return Response.json({ ok: false, error: "no PDF supplied" }, { status: 400 });
   }
 
-  if (existsSync(PDF_FILE)) unlinkSync(PDF_FILE);
-  await Bun.write(PDF_FILE, file);
+  await Bun.write(PDF_FILE, file); // overwrites any previous upload
 
   const args = [PDF2GCODE, PDF_FILE, "--output-dir", DATA_DIR];
   const num = (k: string, flag: string) => {
@@ -90,21 +85,24 @@ async function handleUpload(req: Request): Promise<Response> {
   if (code !== 0) {
     return Response.json({ ok: false, error: err || out || "conversion failed" });
   }
-  // pdf2gcode names output after the PDF base: lastUploadedPDF.gcode → lastJob.gcode
-  const produced = `${DATA_DIR}/lastUploadedPDF.gcode`;
-  if (!existsSync(produced)) {
+
+  const produced = Bun.file(`${DATA_DIR}/lastUploadedPDF.gcode`);
+  if (!(await produced.exists()))
     return Response.json({ ok: false, error: "no gcode produced\n" + out });
-  }
-  if (existsSync(GCODE_FILE)) unlinkSync(GCODE_FILE);
-  renameSync(produced, GCODE_FILE);
+
+  await Bun.write(GCODE_FILE, produced); // move into place (overwrites)
+  await produced.delete();
   return Response.json({ ok: true });
 }
 
-const PAGE = `<!doctype html>
-<html><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Permablot</title>
-</head><body>
+const PAGE = `<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Permablot</title>
+</head>
+<body>
 
 <fieldset><legend>Upload</legend>
   <form id="up">
@@ -134,68 +132,67 @@ const PAGE = `<!doctype html>
 </fieldset>
 
 <script>
-const $ = (s) => document.querySelector(s);
+  const $ = (s) => document.querySelector(s);
 
-async function post(url, body) {
-  const r = await fetch(url, body ? {method: "POST", body} : { method:"POST" });
-  return r.json().catch(() => ({}));
-}
+  async function post(url, body) {
+    const r = await fetch(url, body ? {method: "POST", body} : { method:"POST" });
+    return r.json().catch(() => ({}));
+  };
 
-function render(s) {
-  $("#status").textContent =
-    s.state === "idle" ? "Not running" : s.state[0].toUpperCase()+s.state.slice(1);
+  function render(s) {
+    $("#status").textContent =
+      s.state === "idle" ? "Not running" : s.state[0].toUpperCase()+s.state.slice(1);
+
+    for (const el of document.getElementsByName("q")) {
+      el.checked = el.value === s.quality;
+      el.disabled = el.value === s.quality;
+    };
+
+    // controls only when idle
+    const c = $("#controls");
+    if (s.state === "idle") {
+      c.innerHTML =
+        '<button id="bsleep">Sleep</button>' +
+        '<button id="block">' + (s.motorsLocked ? "Unlock motors" : "Lock motors") + '</button>';
+      $("#bsleep").onclick = async () => { await post("/sleep"); };
+      $("#block").onclick = async () => { await post(s.motorsLocked ? "/unlock" : "/lock"); };
+    } else {
+      c.innerHTML = "";
+    };
+  };
 
   for (const el of document.getElementsByName("q")) {
-    el.checked = el.value === s.quality;
-    el.disabled = el.value === s.quality;
-  }
+    el.addEventListener("change", async () => {
+      await post("/quality", new URLSearchParams({q: el.value}));
+    });
+  };
 
-  // controls only when idle
-  const c = $("#controls");
-  if (s.state === "idle") {
-    c.innerHTML =
-      '<button id="bsleep">Sleep</button>' +
-      '<button id="block">' + (s.motorsLocked ? "Unlock motors" : "Lock motors") + '</button>';
-    $("#bsleep").onclick = async () => { await post("/sleep"); };
-    $("#block").onclick = async () => { await post(s.motorsLocked ? "/unlock" : "/lock"); };
-  } else {
-    c.innerHTML = "";
-  }
-}
-
-for (const el of document.getElementsByName("q")) {
-  el.addEventListener("change", async () => {
-    await post("/quality", new URLSearchParams({q: el.value}));
+  $("#up").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    $("#upbtn").disabled = true;
+    $("#uplog").textContent = "Converting to gcode...";
+    const res = await post("/upload", new FormData($("#up")));
+    $("#uplog").textContent = res.ok ? "Done!" : "Error: " + (res.error||"failed");
+    $("#upbtn").disabled = false;
   });
-}
 
-$("#up").addEventListener("submit", async (e) => {
-  e.preventDefault();
-  $("#upbtn").disabled = true;
-  $("#uplog").textContent = "Converting to gcode...";
-  const res = await post("/upload", new FormData($("#up")));
-  $("#uplog").textContent = res.ok ? "Done!" : "Error: " + (res.error||"failed");
-  $("#upbtn").disabled = false;
-});
-
-const es = new EventSource("/events");
-es.onmessage = (e) => render(JSON.parse(e.data));
+  const es = new EventSource("/events");
+  es.onmessage = (e) => render(JSON.parse(e.data));
 </script>
-</body></html>`;
+</body>
+</html>`;
 
 Bun.serve({
   port: 80,
-  idleTimeout: 255, // keep SSE connections (and long PDF conversions) alive
+  idleTimeout: 255, // keep SSE connections and long PDF conversions alive
   async fetch(req) {
     const url = new URL(req.url);
     const { pathname } = url;
 
-    if (pathname === "/" && req.method === "GET") {
+    if (pathname === "/" && req.method === "GET")
       return new Response(PAGE, { headers: { "content-type": "text/html" } });
-    }
-    if (pathname === "/state" && req.method === "GET") {
-      return Response.json(await readState());
-    }
+    if (pathname === "/upload" && req.method === "POST")
+      return handleUpload(req);
     if (pathname === "/events" && req.method === "GET") {
       let controllerRef: ReadableStreamDefaultController;
       let ping: ReturnType<typeof setInterval>;
@@ -211,30 +208,27 @@ Bun.serve({
         cancel() {
           clearInterval(ping);
           sseClients.delete(controllerRef);
-        },
+        }
       });
       return new Response(stream, {
         headers: {
           "content-type": "text/event-stream",
           "cache-control": "no-cache",
-        },
+        }
       });
-    }
-    if (pathname === "/upload" && req.method === "POST") {
-      return handleUpload(req);
-    }
+    };
     if (pathname === "/quality" && req.method === "POST") {
       const body = await req.formData();
       const q = String(body.get("q"));
       if (q !== "draft" && q !== "poster") {
         return Response.json({ ok: false }, { status: 400 });
-      }
+      };
       return Response.json({ ok: (await daemon("quality:" + q)) === "ok" });
-    }
+    };
     if (["/lock", "/unlock", "/sleep"].includes(pathname) && req.method === "POST") {
       const reply = await daemon(pathname.slice(1));
       return Response.json({ ok: reply === "ok" });
-    }
+    };
     return new Response("not found", { status: 404 });
   }
 });
