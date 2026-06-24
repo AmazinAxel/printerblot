@@ -2,9 +2,9 @@ import { watch } from "fs"; // no Bun-native file watcher yet
 
 const DATA_DIR = process.env.BLOT_DATA_DIR; // runtime state
 const REPO = process.env.BLOT_REPO; // printerblot source
-const STATE_FILE = `${DATA_DIR}/state.json`;
-const PDF_FILE = `${DATA_DIR}/lastUploadedPDF.pdf`;
-const GCODE_FILE = `${DATA_DIR}/lastJob.gcode`;
+const STATE_FILE = DATA_DIR + 'state.json';
+const PDF_FILE = DATA_DIR + '/lastUploadedPDF.pdf';
+const GCODE_FILE = DATA_DIR + '/lastJob.gcode';
 const PDF2GCODE = process.env.PDF2GCODE;
 const SOCKET_PATH = "/run/blot-socket/blot-socket.sock";
 
@@ -86,7 +86,7 @@ async function handleUpload(req: Request): Promise<Response> {
     return Response.json({ ok: false, error: err || out || "Conversion failed" });
   }
 
-  const produced = Bun.file(`${DATA_DIR}/lastUploadedPDF.gcode`);
+  const produced = Bun.file(DATA_DIR + '/lastUploadedPDF.gcode');
   if (!(await produced.exists()))
     return Response.json({ ok: false, error: "No gcode produced\n" + out });
 
@@ -95,92 +95,7 @@ async function handleUpload(req: Request): Promise<Response> {
   return Response.json({ ok: true });
 }
 
-const PAGE = `<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>Permablot</title>
-</head>
-<body>
-
-<fieldset><legend>Upload</legend>
-  <form id="up">
-    <input type="file" name="pdf" accept="application/pdf" required>
-    <div class="row">
-      <label>Threshold <input type="number" name="threshold" value="128" min="0" max="255"></label>
-      <label>Scale <input type="number" name="scale" value="1.0" step="0.1" min="0" max="1"></label>
-    </div>
-    <div class="row">
-      <label>DPI <input type="number" name="dpi" value="300" min="50"></label>
-      <label>Margin <input type="number" name="margin" value="2" step="0.5" min="0"></label>
-      <label><input type="checkbox" name="nocrop"> No crop</label>
-    </div>
-    <button id="upbtn" type="submit">Upload</button>
-  </form>
-  <div id="uplog"></div>
-</fieldset>
-
-<fieldset><legend>Quality</legend>
-  <label><input type="radio" name="q" value="draft"> Draft</label>
-  <label><input type="radio" name="q" value="poster"> Poster</label>
-</fieldset>
-
-<fieldset><legend>Machine control</legend>
-  <span id="status">...</span>
-  <div id="controls" class="row" style="margin-top:.6rem"></div>
-</fieldset>
-
-<script>
-  const $ = (s) => document.querySelector(s);
-
-  async function post(url, body) {
-    const r = await fetch(url, body ? {method: "POST", body} : { method:"POST" });
-    return r.json().catch(() => ({}));
-  };
-
-  function render(s) {
-    $("#status").textContent =
-      s.state === "idle" ? "Not running" : s.state[0].toUpperCase()+s.state.slice(1);
-
-    for (const el of document.getElementsByName("q")) {
-      el.checked = el.value === s.quality;
-      el.disabled = el.value === s.quality;
-    };
-
-    // controls only when idle
-    const c = $("#controls");
-    if (s.state === "idle") {
-      c.innerHTML =
-        '<button id="bsleep">Sleep</button>' +
-        '<button id="block">' + (s.motorsLocked ? "Unlock motors" : "Lock motors") + '</button>';
-      $("#bsleep").onclick = async () => { await post("/sleep"); };
-      $("#block").onclick = async () => { await post(s.motorsLocked ? "/unlock" : "/lock"); };
-    } else {
-      c.innerHTML = "";
-    };
-  };
-
-  for (const el of document.getElementsByName("q")) {
-    el.addEventListener("change", async () => {
-      await post("/quality", new URLSearchParams({q: el.value}));
-    });
-  };
-
-  $("#up").addEventListener("submit", async (e) => {
-    e.preventDefault();
-    $("#upbtn").disabled = true;
-    $("#uplog").textContent = "Converting to gcode...";
-    const res = await post("/upload", new FormData($("#up")));
-    $("#uplog").textContent = res.ok ? "Done!" : "Error: " + (res.error||"failed");
-    $("#upbtn").disabled = false;
-  });
-
-  const es = new EventSource("/events");
-  es.onmessage = (e) => render(JSON.parse(e.data));
-</script>
-</body>
-</html>`;
+const PAGE = await Bun.file(REPO + '/webpage.html').text();
 
 Bun.serve({
   port: 80,
@@ -225,7 +140,7 @@ Bun.serve({
       };
       return Response.json({ ok: (await daemon("quality:" + q)) === "ok" });
     };
-    if (["/lock", "/unlock", "/sleep"].includes(pathname) && req.method === "POST") {
+    if (["/print", "/lock", "/unlock", "/sleep"].includes(pathname) && req.method === "POST") {
       const reply = await daemon(pathname.slice(1));
       return Response.json({ ok: reply === "ok" });
     };

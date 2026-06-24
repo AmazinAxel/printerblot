@@ -26,7 +26,7 @@ RETURN_RATE = 3000
 # TODO adjust these
 QUALITY = {
     "draft":  {"$110": 16000, "$120": 16000, "$140": 0.05, "$141": 0.004},
-    "poster": {"$110": 4000,  "$120": 1000,  "$140": 0.01, "$141": 0.002},
+    "poster": {"$110": 4000,  "$120": 1000,  "$140": 0.01, "$141": 0.002}
 }
 
 DEFAULT_STATE = {"state": "idle", "quality": "draft", "motorsLocked": False}
@@ -320,6 +320,7 @@ def start_socket(q):
     srv.listen(8)
 
     VERBS = {
+        "print": ("START",),
         "lock": ("LOCK",), "unlock": ("UNLOCK",), "sleep": ("SLEEP",),
         "quality:draft": ("QUALITY", "draft"),
         "quality:poster": ("QUALITY", "poster"),
