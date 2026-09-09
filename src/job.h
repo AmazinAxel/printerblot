@@ -41,7 +41,9 @@ JobState job_state();
 uint32_t job_lines_done();
 uint32_t job_lines_total();
 
-bool job_motors_locked();
+// True if the last job stopped on an error (e.g. a move outside the work
+// envelope) rather than running to completion. Cleared when a job starts.
+bool job_had_error();
 
 // Print quality preset ("draft" or "poster"), persisted in settings.
 void job_set_quality(const char *q);

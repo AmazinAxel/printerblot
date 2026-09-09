@@ -64,6 +64,12 @@ The script does all of the above automatically, including the CoreXY-aware push/
 1. Put a pen in the holder; tape down a sheet of paper.
 2. **Hand-move** the carriage so there's ~120 mm of free travel in both `+X` and `+Y`. (The script uses 100 mm for axis tests and ~71 mm for the diagonals.)
 3. Close anything else that owns the USB port (a serial monitor, etc).
+4. **Power-cycle the board first, or start from the machine origin.** The
+   patterns run out to X100/Y50 and soft limits (`$20`) measure against
+   *machine* coordinates, which start at (0, 0) on boot. `G92 X0 Y0` moves
+   only the work origin, so if you've already jogged a long way out, the
+   tests can trip `error:15` even though the pen has room. A fresh power-up
+   puts both frames back in sync.
 4. Install `pyserial` if you don't have it:
    ```bash
    pip3 install pyserial

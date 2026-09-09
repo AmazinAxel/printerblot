@@ -1,6 +1,7 @@
 #include "planner.h"
 #include "kinematics.h"
 #include "stepper.h"
+#include "settings.h"   // work_area_max_{x,y}_mm, for soft limits
 
 // Ring buffer of planned blocks. head = next slot to write. tail = block
 // the stepper is currently executing (or about to). planned = oldest block
@@ -352,12 +353,44 @@ static void planner_recalculate() {
     buffer_planned = buffer_tail;
 }
 
+// ───────── soft limits ─────────
+
+bool planner_soft_limits_enabled = true;
+
+// Targets are machine coordinates (G92 offsets are already applied by the
+// caller), which is the frame the envelope is measured in.
+//
+// The tolerance absorbs float round-trips through the CoreXY transform and
+// the ±0.5-step rounding below: a job legitimately drawn to exactly X=125.0
+// must not be rejected because the arithmetic landed on 125.0000076. One
+// microstep is 1/80 mm, so half a microstep is comfortably below anything
+// mechanically meaningful while still catching real overruns.
+bool plan_target_in_bounds(float x, float y) {
+    if (!planner_soft_limits_enabled) return true;
+    const float tol = 0.5f / STEPS_PER_MM;
+    return x >= -tol && y >= -tol &&
+           x <= work_area_max_x_mm + tol &&
+           y <= work_area_max_y_mm + tol;
+}
+
 // ───────── public queueing ─────────
 
 bool plan_buffer_line(float x_target, float y_target,
                       float feedrate_mm_min, bool rapid) {
     // Back-pressure: caller should check plan_buffer_available() first.
     if (next_index(buffer_head) == buffer_tail) return false;
+
+    // Soft limits. Every motion path (G0/G1, each arc segment, G28, and the
+    // job feeder) funnels through here, so this one check covers them all —
+    // guarding the individual callers would be both longer and easy to miss
+    // a path with.
+    //
+    // Rejecting rather than clamping is deliberate: clamping would silently
+    // deform the drawing and keep going, while a refusal stops at the first
+    // bad move with an error the caller reports. There are no limit switches,
+    // so driving into the frame is a mechanical crash at up to 16000 mm/min —
+    // the machine cannot detect or recover from it on its own.
+    if (!plan_target_in_bounds(x_target, y_target)) return false;
 
     float dx = x_target - last_pos[0];
     float dy = y_target - last_pos[1];

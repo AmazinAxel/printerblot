@@ -104,8 +104,9 @@ Anything else beginning with `$` returns `error:3` (invalid statement) or
 | `$112` | `motor_max_rate`      | `16402`   | mm/min (motor-space physical cap) |
 | `$120` | `max_acceleration`    | `16606`   | mm/s² (Cartesian tip) |
 | `$122` | `motor_max_accel`     | `16606`   | mm/s² (motor-space physical cap) |
-| `$130` | `max_travel_x`        | `125`     | mm (documentation only; not soft-limit-enforced) |
-| `$131` | `max_travel_y`        | `125`     | mm (documentation only) |
+| `$20`  | `soft_limits`         | `1`       | 1 = enforce the work envelope, 0 = disable |
+| `$130` | `max_travel_x`        | `125`     | mm — X work envelope (enforced when `$20=1`) |
+| `$131` | `max_travel_y`        | `125`     | mm — Y work envelope (enforced when `$20=1`) |
 | `$140` | `junction_deviation`  | `0.05`    | mm — corner tolerance; smaller ⇒ tighter corners, slower cornering |
 | `$141` | `arc_tolerance`       | `0.002`   | mm — max chord deviation from true arc |
 | `$150` | `servo_pen_up_us`     | `1000`    | µs |
@@ -202,10 +203,9 @@ GRBL-compatible subset. Returned as `error:<N>\r\n`.
 | `2`  | Numeric value format is not valid                             |
 | `3`  | `$` statement is not valid                                    |
 | `4`  | Negative value not allowed                                    |
-| `5`  | Setting disabled                                              |
+| `15` | Move outside the work envelope (`$130`/`$131`) — see soft limits |
 | `20` | Unsupported or invalid G/M code                               |
 | `21` | Modal group violation (two codes from the same group on one line) |
-| `31` | Invalid target                                                |
 | `33` | Invalid arc radius (R too small, or I/J resolve to zero)      |
 | `60` | Line overflow (exceeded 95-char line buffer)                  |
 

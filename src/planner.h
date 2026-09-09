@@ -55,10 +55,21 @@ void plan_reset();                          // flush buffer; call on soft reset
 bool plan_is_empty();
 uint8_t plan_buffer_available();            // slots free (for host flow control hints)
 
-// Linear Cartesian move. Returns true if queued, false if buffer full.
+// Linear Cartesian move. Returns true if queued; false if the buffer is full
+// OR the target is outside the soft-limit envelope.
 // feedrate is in mm/min (GRBL convention). 'rapid' uses the G0 feedrate cap.
 bool plan_buffer_line(float x_target_mm, float y_target_mm,
                       float feedrate_mm_min, bool rapid);
+
+// True if (x, y) — machine coordinates — is inside the work envelope
+// ($130/$131), or if soft limits are disabled. Callers use this to reject a
+// move *before* waiting on a planner slot, so an out-of-bounds line reports
+// an error instead of blocking.
+bool plan_target_in_bounds(float x_mm, float y_mm);
+
+// Soft-limit master switch ($20). On by default: there are no limit switches,
+// so an out-of-range move is a mechanical crash with nothing to stop it.
+extern bool planner_soft_limits_enabled;
 
 // Queue a sync command as a zero-distance block. Guarantees the side-effect
 // fires in-order relative to motion.

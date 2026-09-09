@@ -16,7 +16,11 @@ int   servo_pen_down_us  = DEFAULT_PEN_DOWN_US;
 // be treated as invalid and compile defaults will be used until the next
 // save.
 static const uint32_t SETTINGS_MAGIC   = 0xB107B107u;
-static const uint32_t SETTINGS_VERSION = 1u;
+// v2 added soft_limits_enabled. A v1 blob is rejected outright rather than
+// partially loaded — which means an existing machine silently reverts to
+// compile-time defaults on the first boot after this upgrade. That's the
+// safe direction (soft limits default ON), but re-run tune.py afterwards.
+static const uint32_t SETTINGS_VERSION = 2u;
 
 struct SavedSettings {
     uint32_t magic;
@@ -32,6 +36,7 @@ struct SavedSettings {
     float    arc_tolerance_mm;
     int      pen_up_us;
     int      pen_down_us;
+    bool     soft_limits_enabled;
 };
 
 #define EEPROM_BYTES  (sizeof(SavedSettings) + 16)
@@ -53,6 +58,7 @@ void settings_load() {
     work_area_max_y_mm             = s.max_y_mm;
     servo_pen_up_us                = s.pen_up_us;
     servo_pen_down_us              = s.pen_down_us;
+    planner_soft_limits_enabled    = s.soft_limits_enabled;
 }
 
 // ───── debounced / idle-gated save ─────
@@ -78,7 +84,10 @@ void settings_mark_dirty() {
 }
 
 static void do_flash_write() {
-    SavedSettings s;
+    // Zero-init so the struct's tail padding is deterministic — the memcmp
+    // below compares raw bytes, and indeterminate padding would make an
+    // unchanged blob look different and burn an erase cycle every time.
+    SavedSettings s = {};
     s.magic                   = SETTINGS_MAGIC;
     s.version                 = SETTINGS_VERSION;
     s.max_feedrate_mm_min     = planner_max_feedrate_mm_min;
@@ -92,6 +101,7 @@ static void do_flash_write() {
     s.arc_tolerance_mm        = planner_arc_tolerance_mm;
     s.pen_up_us               = servo_pen_up_us;
     s.pen_down_us             = servo_pen_down_us;
+    s.soft_limits_enabled     = planner_soft_limits_enabled;
 
     // Skip the write when nothing actually changed. Flash endurance is finite
     // (~100k erase cycles) and the web UI re-sends the whole quality preset on
@@ -117,6 +127,7 @@ void settings_restore_defaults() {
     work_area_max_y_mm             = DEFAULT_MAX_Y_MM;
     servo_pen_up_us                = DEFAULT_PEN_UP_US;
     servo_pen_down_us              = DEFAULT_PEN_DOWN_US;
+    planner_soft_limits_enabled    = true;   // safe default: no limit switches
 }
 
 void settings_service_save() {

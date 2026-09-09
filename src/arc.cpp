@@ -9,7 +9,10 @@ float planner_arc_tolerance_mm = DEFAULT_ARC_TOLERANCE;
 bool arc_interpolate(float target_x, float target_y,
                      float offset_i, float offset_j,
                      bool clockwise,
-                     float feedrate_mm_min) {
+                     float feedrate_mm_min,
+                     bool *out_of_bounds) {
+    if (out_of_bounds) *out_of_bounds = false;
+
     float start_x, start_y;
     plan_get_position(&start_x, &start_y);
 
@@ -64,6 +67,43 @@ bool arc_interpolate(float target_x, float target_y,
     if (n_seg > n_seg_by_length) n_seg = n_seg_by_length;
     if (n_seg < 1) n_seg = 1;
     if (n_seg > 4096) n_seg = 4096;
+
+    // Soft-limit the whole arc before emitting a single segment. An arc can
+    // bulge outside the envelope while both endpoints sit inside it, and
+    // rejecting half-way through would leave the pen stranded mid-curve with
+    // part of the shape already drawn.
+    //
+    // Exact, not sampled: the extremes of a circular arc are its two
+    // endpoints plus whichever of the four axis-crossing points (angles 0,
+    // π/2, π, 3π/2) the sweep actually passes through.
+    {
+        float min_x = fminf(start_x, target_x), max_x = fmaxf(start_x, target_x);
+        float min_y = fminf(start_y, target_y), max_y = fmaxf(start_y, target_y);
+        for (int q = 0; q < 4; q++) {
+            float ang = (float)M_PI_2 * (float)q;
+            // Angle of this axis crossing relative to the start, normalised
+            // into the direction of travel; inside the sweep ⇒ it's reached.
+            float rel = ang - theta_start;
+            if (clockwise) {
+                while (rel > 0.0f)            rel -= 2.0f * (float)M_PI;
+                while (rel < -2.0f*(float)M_PI) rel += 2.0f * (float)M_PI;
+                if (rel < sweep) continue;    // sweep is negative when CW
+            } else {
+                while (rel < 0.0f)            rel += 2.0f * (float)M_PI;
+                while (rel > 2.0f*(float)M_PI) rel -= 2.0f * (float)M_PI;
+                if (rel > sweep) continue;
+            }
+            float ex = cx + radius * cosf(ang);
+            float ey = cy + radius * sinf(ang);
+            min_x = fminf(min_x, ex); max_x = fmaxf(max_x, ex);
+            min_y = fminf(min_y, ey); max_y = fmaxf(max_y, ey);
+        }
+        if (!plan_target_in_bounds(min_x, min_y) ||
+            !plan_target_in_bounds(max_x, max_y)) {
+            if (out_of_bounds) *out_of_bounds = true;
+            return false;
+        }
+    }
 
     float delta = sweep / (float)n_seg;
     float cos_d = cosf(delta);

@@ -3,8 +3,8 @@
 #include "config.h"
 
 // Work area (physical envelope). Origin (0, 0) is bottom-left; +X right,
-// +Y up. Used for documentation today; when we add $20 soft-limits they
-// become hard bounds.
+// +Y up. Enforced as soft limits in plan_buffer_line() whenever
+// planner_soft_limits_enabled ($20) is set — see planner.h.
 extern float work_area_max_x_mm;
 extern float work_area_max_y_mm;
 

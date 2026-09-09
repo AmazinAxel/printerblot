@@ -37,31 +37,42 @@ static const char *state_name() {
 }
 
 // The state blob the UI renders from. Also the SSE payload; see below.
-static String state_json() {
+//
+// snprintf into a caller-supplied buffer rather than building a String: this
+// runs on every progress tick and every request, and the String version did
+// ten reallocating appends plus two temporary Strings for the floats. The
+// output is bounded and small, so a stack buffer is both faster and takes no
+// heap — which matters because the parser is allocating on the same core.
+static void state_json(char *out, size_t cap) {
     float x = 0, y = 0;
     stepper_get_machine_position_mm(&x, &y);
-    String s = "{\"state\":\"";
-    s += state_name();
-    s += "\",\"quality\":\"";
-    s += job_quality();
-    s += "\",\"motorsLocked\":";
-    s += job_motors_locked() ? "true" : "false";
-    s += ",\"done\":";
-    s += job_lines_done();
-    s += ",\"total\":";
-    s += job_lines_total();
-    s += ",\"x\":";
-    s += String(x, 2);
-    s += ",\"y\":";
-    s += String(y, 2);
-    s += "}";
-    return s;
+    snprintf(out, cap,
+             "{\"state\":\"%s\",\"quality\":\"%s\","
+             "\"error\":%s,\"done\":%lu,\"total\":%lu,\"x\":%.2f,\"y\":%.2f}",
+             state_name(),
+             job_quality(),
+             job_had_error()     ? "true" : "false",
+             (unsigned long)job_lines_done(),
+             (unsigned long)job_lines_total(),
+             x, y);
 }
+
+// Longest realistic payload is ~150 bytes; 192 leaves headroom for the two
+// float fields at their widest without risking truncation.
+#define STATE_JSON_CAP 192
 
 // Pushed to every connected browser on each state change, so a UI that
 // didn't cause the change still sees it.
 static void broadcast_state() {
-    events.send(state_json().c_str(), "message", millis());
+    // Skip the work entirely when nobody's watching. events.send() with zero
+    // clients still formats the payload and walks the client list, and this
+    // is called on the parser's core several times a second during a print —
+    // the common case for this machine is running unattended with no browser
+    // open at all.
+    if (events.count() == 0) return;
+    char buf[STATE_JSON_CAP];
+    state_json(buf, sizeof(buf));
+    events.send(buf, "message", millis());
 }
 
 static void send_ok(AsyncWebServerRequest *req, bool ok) {
@@ -160,12 +171,16 @@ void webui_init() {
     job_set_on_change(broadcast_state);
 
     events.onConnect([](AsyncEventSourceClient *c) {
-        c->send(state_json().c_str(), "message", millis());
+        char buf[STATE_JSON_CAP];
+        state_json(buf, sizeof(buf));
+        c->send(buf, "message", millis());
     });
     server.addHandler(&events);
 
     server.on("/state", HTTP_GET, [](AsyncWebServerRequest *req) {
-        req->send(200, "application/json", state_json());
+        char buf[STATE_JSON_CAP];
+        state_json(buf, sizeof(buf));
+        req->send(200, "application/json", buf);
     });
 
     server.on("/print", HTTP_POST, [](AsyncWebServerRequest *req) {

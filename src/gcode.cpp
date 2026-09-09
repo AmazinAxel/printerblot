@@ -156,6 +156,7 @@ static StatusCode handle_dollar(char *line) {
         Serial.print(F("$120=")); Serial.println(planner_max_accel_mm_s2, 3);
         Serial.print(F("$121=")); Serial.println(planner_max_accel_mm_s2, 3);  // Y mirror
         Serial.print(F("$122=")); Serial.println(planner_motor_max_accel_mm_s2, 3);
+        Serial.print(F("$20=")); Serial.println(planner_soft_limits_enabled ? 1 : 0);
         Serial.print(F("$130=")); Serial.println(work_area_max_x_mm, 3);
         Serial.print(F("$131=")); Serial.println(work_area_max_y_mm, 3);
         Serial.print(F("$140=")); Serial.println(planner_junction_deviation_mm, 4);
@@ -187,6 +188,7 @@ static StatusCode handle_dollar(char *line) {
     if (*vend != '\0') return STATUS_BAD_NUMBER_FORMAT;
     if (v < 0.0f && id != 130 && id != 131) return STATUS_NEGATIVE_VALUE;
     switch (id) {
+        case 20:  planner_soft_limits_enabled    = (v != 0.0f); break;
         case 110: planner_max_feedrate_mm_min    = v; break;
         case 111: planner_max_rapid_mm_min       = v; break;
         case 112: planner_motor_max_rate_mm_min  = v; break;
@@ -351,6 +353,10 @@ static StatusCode apply_modal(Line *ln) {
     if (non_modal == 28) {
         float tx = modal.offset[0];
         float ty = modal.offset[1];
+        // The G92 origin can itself sit outside the envelope, so G28 is not
+        // implicitly safe — check it like any other move.
+        if (!plan_target_in_bounds(tx, ty)) return STATUS_TRAVEL_EXCEEDED;
+        if (!wait_for_slot()) return STATUS_OVERFLOW;
         if (!plan_buffer_line(tx, ty, planner_max_rapid_mm_min, true))
             return STATUS_OVERFLOW;
     }
@@ -399,6 +405,9 @@ static StatusCode apply_modal(Line *ln) {
         if (modal.motion == 0 || modal.motion == 1) {
             float fr = (modal.motion == 0) ? planner_max_rapid_mm_min
                                            : modal.feedrate;
+            // Check bounds before waiting for a slot: an out-of-range move
+            // should report immediately, not block until the buffer drains.
+            if (!plan_target_in_bounds(tx, ty)) return STATUS_TRAVEL_EXCEEDED;
             if (!wait_for_slot()) return STATUS_OVERFLOW;
             plan_buffer_line(tx, ty, fr, modal.motion == 0);
         } else if (modal.motion == 2 || modal.motion == 3) {
@@ -435,8 +444,9 @@ static StatusCode apply_modal(Line *ln) {
                 j = cy - cur_y;
             }
             bool cw = (modal.motion == 2);
-            if (!arc_interpolate(tx, ty, i, j, cw, modal.feedrate))
-                return STATUS_ARC_RADIUS_ERROR;
+            bool oob = false;
+            if (!arc_interpolate(tx, ty, i, j, cw, modal.feedrate, &oob))
+                return oob ? STATUS_TRAVEL_EXCEEDED : STATUS_ARC_RADIUS_ERROR;
         }
     }
 

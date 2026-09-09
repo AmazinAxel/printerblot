@@ -198,6 +198,33 @@ what a Cartesian printer does), pure X/Y moves are the *fastest* directions
 on Blot; ±45° diagonals are the slowest. This is the opposite of most users'
 intuition — keep it in mind when setting `$110`. See [TUNING.md](TUNING.md).
 
+## Soft limits
+
+There are no limit switches, so nothing physically stops the carriage — a
+move past the frame is a crash at up to 16000 mm/min that the machine can
+neither detect nor recover from. Soft limits are the only guard, and they're
+on by default (`$20=1`).
+
+The check lives in `plan_buffer_line()`, the one function every motion path
+funnels through (G0/G1, each arc segment, G28, the job feeder), so there's no
+route that can bypass it. Two details worth knowing:
+
+- **Arcs are checked as a whole, before the first segment is queued.** An arc
+  can bulge outside the envelope while both endpoints sit inside it. The test
+  uses the exact bounding box — the two endpoints plus whichever of the four
+  axis-crossing points the sweep actually passes through — so a rejected arc
+  draws *nothing* instead of stopping half-way round.
+- **Out of range rejects, it doesn't clamp.** Clamping would silently deform
+  the drawing and carry on; a refusal stops at the first bad move with
+  `error:15`. Inside a job, that aborts the print (and says so in the web UI)
+  rather than skipping lines and producing a mangled image.
+
+Limits apply to **machine** coordinates. `G92` moves the *work* origin, not
+the machine's, so setting an origin in the middle of the bed genuinely
+reduces how far you can draw — that's the constraint being reported, not a
+bug. The envelope is `$130` × `$131`, default 125 × 125 mm, matching what
+`tools/pdf2gcode.py` scales output to.
+
 ## Power and wear behaviour
 
 Deliberate, because this machine is meant to be left plugged in:
@@ -262,7 +289,8 @@ Until you've done steps 1–6, don't run real art through it.
 - No `$H` hard homing (there's nothing to home against)
 - No EEPROM compatibility with GRBL's settings layout — settings IDs are
   GRBL-ish but values and semantics differ
-- No soft limits: `$130`/`$131` are documentation, not enforced
+- No *hard* limits (no switches to trip) — but soft limits ARE enforced, see
+  below
 
 If you need any of those, use stock GRBL-HAL on a board with the right I/O.
 

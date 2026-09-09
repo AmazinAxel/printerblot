@@ -21,6 +21,10 @@ static const uint32_t RETURN_RATE_MM_MIN = 3000;
 // can't starve the parser; mirrors GRBL-style flow control.
 static const uint8_t PLANNER_HEADROOM = 2;
 
+// How often to push progress to connected browsers while printing.
+static const uint32_t PROGRESS_INTERVAL_MS = 200;
+static uint32_t last_progress_ms = 0;
+
 static File     job_file;
 static JobState state = JOB_IDLE;
 static uint32_t lines_done = 0;
@@ -30,6 +34,9 @@ static bool     pen_is_down = false;
 // planner drains, not when the button is pressed). Keeps resume from issuing
 // an M3 that was never matched by an M5.
 static bool     pen_lifted_for_pause = false;
+// Set when a job stops because of an error rather than reaching the end, so
+// the UI can say so instead of reporting a normal finish.
+static bool     job_error = false;
 static char     quality[8] = "draft";
 
 // Machine coordinates where the job started, so a stop can drive back.
@@ -134,10 +141,11 @@ void job_stop()   { if (state != JOB_IDLE)    req_stop = true; }
 JobState job_state()       { return state; }
 uint32_t job_lines_done()  { return lines_done; }
 uint32_t job_lines_total() { return lines_total; }
-// Read the enable pin rather than the cached flag: a jog or a G-code move
-// sent over USB re-energises the drivers without going through job.cpp, and
-// the UI should show what the machine is actually doing.
-bool     job_motors_locked() { return digitalRead(PIN_DRIVER_EN) == LOW; }
+// Internal only: the UI manages motors automatically and has no lock control,
+// so this isn't reported over HTTP. Reads the pin rather than a cached flag
+// because motion sent over USB energises the drivers behind job.cpp's back.
+static bool motors_energised() { return digitalRead(PIN_DRIVER_EN) == LOW; }
+bool     job_had_error()     { return job_error; }
 const char *job_quality()    { return quality; }
 
 // Quality presets, derived from tune.py on this machine:
@@ -186,6 +194,7 @@ static void begin_job() {
     stepper_get_machine_position_mm(&origin_x, &origin_y);
     pen_is_down = false;
     pen_lifted_for_pause = false;
+    job_error = false;
     lines_done = 0;
     // Energise before the first move so the carriage is held from the start;
     // the idle auto-unlock may well have released it since the last print.
@@ -233,7 +242,7 @@ static void service_idle_unlock() {
     // Pin state, not a cached flag: motion sent over USB re-enables the
     // drivers behind job.cpp's back, and that motion should re-arm the
     // auto-unlock exactly like a print does.
-    if (!job_motors_locked()) return;
+    if (!motors_energised()) return;
     // JOB_PAUSED must keep holding: releasing mid-job would lose registration
     // and the resumed print would be offset.
     if (state != JOB_IDLE) return;
@@ -296,12 +305,36 @@ void job_service() {
         if (p[0] == 'M' && p[1] == '3') pen_is_down = true;
         else if (p[0] == 'M' && p[1] == '5') pen_is_down = false;
 
-        gcode_execute_line(buf);
+        StatusCode st = gcode_execute_line(buf);
         lines_done++;
 
-        // Push progress occasionally. Every line would flood the SSE stream
-        // and steal time from the parser; every 64 is smooth enough to watch.
-        if ((lines_done & 63) == 0 && on_change) on_change();
+        // A move outside the work envelope aborts the job rather than being
+        // skipped. Carrying on would silently drop every out-of-range line
+        // and draw a mangled partial image with no indication why — and the
+        // usual cause (a G92 origin set too far across the bed) affects the
+        // whole remainder of the file, not one line.
+        if (st == STATUS_TRAVEL_EXCEEDED) {
+            Serial.print(F("[job] line "));
+            Serial.print(lines_done);
+            Serial.println(F(" outside work area ($130/$131) — job stopped."));
+            job_error = true;
+            end_job(true);
+            return;
+        }
+
+        // Push progress on a timer, not a line count. Each broadcast builds a
+        // JSON String and heap-allocates a queued message per connected
+        // client — all on this core, competing with the parser for heap. A
+        // line count paces badly because line rate varies hugely (a dense
+        // stipple run and a few long strokes are worlds apart), and the
+        // planner refill above emits a burst of lines per call, so "every
+        // 64th" can fire several times in a row. 200ms is smoother than the
+        // eye needs and bounds the cost regardless of job content.
+        uint32_t now = millis();
+        if ((uint32_t)(now - last_progress_ms) >= PROGRESS_INTERVAL_MS) {
+            last_progress_ms = now;
+            if (on_change) on_change();
+        }
     }
 
     if (!job_file.available()) {

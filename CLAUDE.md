@@ -97,8 +97,14 @@ bench-tested migration. Pin an exact release tag, not `stable`.
   flag on the tail block; needs hardware validation to confirm it isn't
   already benign.
 - **Feed hold stops at block boundaries**, not across blocks.
-- `$130`/`$131` are documentation only — soft limits are not enforced, so a
-  gcode file larger than the bed will happily drive into the frame.
+- **Soft limits are enforced** (`$20`, default on) in `plan_buffer_line()` —
+  the single choke point all motion routes through. Arcs are bounds-checked
+  as a whole *before* any segment is queued, using the exact arc bounding box
+  (endpoints + whichever axis crossings the sweep reaches), so a rejected arc
+  draws nothing rather than stranding the pen mid-curve. Out-of-range moves
+  return `error:15`; in a job that aborts the print rather than silently
+  skipping lines. Limits are on **machine** coordinates, so a `G92` origin
+  set far across the bed legitimately shrinks the drawable area.
 
 ## Build / verify
 
