@@ -3,7 +3,6 @@
 #include "stepper.h"
 #include "arc.h"
 #include "settings.h"
-#include "pico/time.h"
 #include <ctype.h>
 #include <stdlib.h>
 #include <Arduino.h>  // for yield() — services USB during tight loops
@@ -22,6 +21,11 @@ typedef struct {
 } ModalState;
 static ModalState modal;
 
+// Tracks what the last *queued* SYNC_SET_ENABLE asked for, so motion lines
+// only queue an enable when the drivers were actually turned off. Matches
+// stepper_init(), which energises the A4988s at boot.
+static bool drivers_enabled = true;
+
 static void set_defaults() {
     modal.motion    = 1;
     modal.units     = 21;
@@ -33,10 +37,15 @@ static void set_defaults() {
 
 void gcode_reset() {
     set_defaults();
+    // A soft reset flushes the planner, so any queued enable/disable is
+    // discarded and the drivers keep whatever state the last *executed* block
+    // left on the pin. Read it back rather than assuming: after an idle
+    // auto-unlock the motors are off, and guessing "enabled" here would skip
+    // the enable the next move needs.
+    drivers_enabled = (digitalRead(PIN_DRIVER_EN) == LOW);  // A4988: LOW = on
 }
 
 // ───────── tokenizer / parser ─────────
-// Kept above handle_dollar() so $J= can reuse the tokenizer.
 
 struct Line {
     uint32_t present;
@@ -128,40 +137,17 @@ static StatusCode tokenize(char *s, Line *ln) {
 // apply_modal() lives below — it's large. Forward-declare.
 static StatusCode apply_modal(Line *ln);
 
-// ───────── settings (persist in RAM only for V1) ─────────
+// ───────── settings ─────────
+// Changes are held in RAM and flushed to flash lazily by settings.cpp.
 
 static StatusCode handle_dollar(char *line) {
-    // `$$`  → dump settings
-    // `$X`  → clear alarm (we have no alarms; treat as no-op ok)
-    // `$H`  → home (unsupported — error)
-    // `$N=value` → set setting N
+    // `$$` / `$`   → dump settings
+    // `$RST=*`     → restore compile-time defaults
+    // `$N=value`   → set setting N
     if (line[1] == '\0' || line[1] == '$') {
-        // UGS's Firmware Settings panel expects the standard GRBL $0-$32
-        // namespace. Emitting plausible stubs for the ones Blot doesn't use
-        // keeps the panel from flagging the firmware as broken and stops
-        // UGS from mis-attributing errors on subsequent commands.
-        Serial.print(F("$0=10\r\n"));       // step pulse µs (unused on RP2040)
-        Serial.print(F("$1=25\r\n"));       // step idle delay
-        Serial.print(F("$2=0\r\n"));        // step port invert
-        Serial.print(F("$3=0\r\n"));        // direction port invert
-        Serial.print(F("$4=0\r\n"));        // step enable invert
-        Serial.print(F("$5=0\r\n"));        // limit pins invert
-        Serial.print(F("$6=0\r\n"));        // probe pin invert
-        Serial.print(F("$10=1\r\n"));       // status report mask
-        Serial.print(F("$11=")); Serial.println(planner_junction_deviation_mm, 3);
-        Serial.print(F("$12=")); Serial.println(planner_arc_tolerance_mm, 4);
-        Serial.print(F("$13=0\r\n"));       // report inches
-        Serial.print(F("$20=0\r\n"));       // soft limits
-        Serial.print(F("$21=0\r\n"));       // hard limits
-        Serial.print(F("$22=0\r\n"));       // homing cycle (disabled — manual G92)
-        Serial.print(F("$23=0\r\n"));       // homing dir invert
-        Serial.print(F("$24=25.000\r\n"));  // homing feed
-        Serial.print(F("$25=500.000\r\n")); // homing seek
-        Serial.print(F("$26=250\r\n"));     // homing debounce
-        Serial.print(F("$27=1.000\r\n"));   // homing pull-off
-        Serial.print(F("$30=1000\r\n"));    // max spindle speed
-        Serial.print(F("$31=0\r\n"));       // min spindle speed
-        Serial.print(F("$32=0\r\n"));       // laser mode
+        // Only the settings this firmware actually implements. The GRBL
+        // $0-$32 stubs (homing, limits, spindle, laser, pin inverts) existed
+        // for UGS's Firmware Settings panel; nothing reads them now.
         Serial.print(F("$100=")); Serial.println(STEPS_PER_MM, 3);
         Serial.print(F("$101=")); Serial.println(STEPS_PER_MM, 3);  // Y mirror of X
         Serial.print(F("$110=")); Serial.println(planner_max_feedrate_mm_min, 3);
@@ -178,23 +164,6 @@ static StatusCode handle_dollar(char *line) {
         Serial.print(F("$151=")); Serial.println(servo_pen_down_us);
         return STATUS_OK;
     }
-    if (line[1] == 'X' || line[1] == 'x') return STATUS_OK;
-    if (line[1] == 'H' || line[1] == 'h') return STATUS_UNSUPPORTED_COMMAND;
-    // `$C` check mode, `$N0=`/`$N1=` startup blocks, `$SLP` sleep — UGS
-    // probes these at connect time. Accept as no-ops so it doesn't stash
-    // errors and mis-attribute them to later lines.
-    if (line[1] == 'C') return STATUS_OK;
-    if (line[1] == 'N') {
-        // `$N` alone → dump startup lines (empty).
-        if (line[2] == '\0') {
-            Serial.print(F("$N0=\r\n$N1=\r\n"));
-            return STATUS_OK;
-        }
-        // `$N0=...` / `$N1=...` → accept & ignore.
-        return STATUS_OK;
-    }
-    if (line[1] == 'S' && line[2] == 'L' && line[3] == 'P') return STATUS_OK;
-
     // `$RST=*` / `$RST=$` / `$RST=#` — reset all settings to compile defaults
     // (GRBL convention). We don't distinguish scopes; all reset everything.
     if (line[1] == 'R' && line[2] == 'S' && line[3] == 'T' && line[4] == '=') {
@@ -205,50 +174,6 @@ static StatusCode handle_dollar(char *line) {
             return STATUS_OK;
         }
         return STATUS_INVALID_STATEMENT;
-    }
-
-    // `$I` → build info. UGS parses the VER line for version detection.
-    if (line[1] == 'I') {
-        Serial.print(F("[VER:1.1f.Blot:]\r\n[OPT:V,"));
-        Serial.print(PLANNER_BUFFER_SIZE);
-        Serial.print(F(","));
-        Serial.print(RX_BUFFER_SIZE);
-        Serial.print(F("]\r\n"));
-        return STATUS_OK;
-    }
-
-    // `$J=...` → one-shot jog move. GRBL convention: the text after `=` is
-    // parsed as a motion line but does NOT modify persistent modal state
-    // (any G90/G91/G20/G21 inside is for this jog only). Used by UGS for
-    // arrow-key jogging and step-jog.
-    if (line[1] == 'J' && line[2] == '=') {
-        ModalState saved = modal;
-        modal.motion = 1;
-        char *body = line + 3;   // skip "$J="
-        if (*body == '\0') { modal = saved; return STATUS_EXPECTED_COMMAND; }
-        Line ln;
-        StatusCode s = tokenize(body, &ln);
-        if (s == STATUS_OK) s = apply_modal(&ln);
-        modal = saved;
-        return s;
-    }
-
-    // `$G` → parser state (for UGS's "G-code State" panel).
-    if (line[1] == 'G') {
-        Serial.print(F("[GC:G"));
-        Serial.print(modal.motion);
-        Serial.print(F(" G"));
-        Serial.print(modal.units);
-        Serial.print(F(" G"));
-        Serial.print(modal.distance);
-        Serial.print(F(" G94 M"));
-        Serial.print(modal.pen_down ? 3 : 5);
-        Serial.print(F(" T0 F"));
-        Serial.print(modal.feedrate, 0);
-        Serial.print(F(" S"));
-        Serial.print(modal.pen_down ? servo_pen_down_us : 0);
-        Serial.print(F("]\r\n"));
-        return STATUS_OK;
     }
 
     // `$N=value`
@@ -334,12 +259,20 @@ static StatusCode apply_modal(Line *ln) {
     // from the preceding motion — e.g., M5 at the end of a long arc-heavy
     // pattern. The motion path already waits this way; sync commands
     // should behave the same.
-    auto wait_for_slot = [&]() {
+    //
+    // Bails out in feed hold instead of spinning. A held stepper never drains
+    // the buffer, and nothing inside this loop can read the `~` that would
+    // release it — so without the check, `!` (or M0) with a full planner
+    // hangs the parser until the 30s watchdog reboots mid-print. The caller
+    // turns a false return into error:60, which is recoverable.
+    auto wait_for_slot = [&]() -> bool {
         while (plan_buffer_available() == 0) {
+            if (stepper_is_in_hold()) return false;
             stepper_wake();
             stepper_service_sync();
             yield();  // service USB so Linux doesn't reset us
         }
+        return true;
     };
 
     // M-codes: pen (M3/M5), motors (M17/M18), pause/end (M0/M2).
@@ -354,24 +287,26 @@ static StatusCode apply_modal(Line *ln) {
                     settings_mark_dirty();
                 }
                 modal.pen_down = true;
-                wait_for_slot();
+                if (!wait_for_slot()) return STATUS_OVERFLOW;
                 if (!plan_sync_command(SYNC_SERVO, us)) return STATUS_OVERFLOW;
                 break;
             }
             case 5: {
                 modal.pen_down = false;
-                wait_for_slot();
+                if (!wait_for_slot()) return STATUS_OVERFLOW;
                 if (!plan_sync_command(SYNC_SERVO, servo_pen_up_us))
                     return STATUS_OVERFLOW;
                 break;
             }
             case 17:
-                wait_for_slot();
+                if (!wait_for_slot()) return STATUS_OVERFLOW;
                 if (!plan_sync_command(SYNC_SET_ENABLE, 1)) return STATUS_OVERFLOW;
+                drivers_enabled = true;
                 break;
             case 18: case 84:
-                wait_for_slot();
+                if (!wait_for_slot()) return STATUS_OVERFLOW;
                 if (!plan_sync_command(SYNC_SET_ENABLE, 0)) return STATUS_OVERFLOW;
+                drivers_enabled = false;
                 break;
             case 0: case 1:
                 // Program pause — treat as feed hold that releases on ~
@@ -391,7 +326,7 @@ static StatusCode apply_modal(Line *ln) {
         if (line_has(ln, 'P')) ms = (int32_t)line_get(ln, 'P');
         else if (line_has(ln, 'S')) ms = (int32_t)(line_get(ln, 'S') * 1000.0f);
         if (ms < 0) ms = 0;
-        wait_for_slot();
+        if (!wait_for_slot()) return STATUS_OVERFLOW;
         if (!plan_sync_command(SYNC_DWELL, ms)) return STATUS_OVERFLOW;
     }
 
@@ -425,7 +360,18 @@ static StatusCode apply_modal(Line *ln) {
     if (has_axis_word && non_modal == 0) {
         // Auto-enable stepper drivers on any motion command so the user
         // doesn't have to send M17 after an M18 at end-of-program.
-        digitalWrite(PIN_DRIVER_EN, LOW);
+        //
+        // Queued, not written directly: parsing runs well ahead of execution,
+        // so an immediate write would re-energise the motors while an earlier
+        // M18 was still draining through the planner — and would defeat the
+        // idle power-down, since the drivers would come back on the moment a
+        // later line was parsed. `drivers_enabled` keeps this to one sync
+        // block per M18→motion transition instead of one per motion line.
+        if (!drivers_enabled) {
+            if (!wait_for_slot()) return STATUS_OVERFLOW;
+            if (!plan_sync_command(SYNC_SET_ENABLE, 1)) return STATUS_OVERFLOW;
+            drivers_enabled = true;
+        }
 
         // Compute target in machine coordinates.
         float cur_x, cur_y;
@@ -453,11 +399,7 @@ static StatusCode apply_modal(Line *ln) {
         if (modal.motion == 0 || modal.motion == 1) {
             float fr = (modal.motion == 0) ? planner_max_rapid_mm_min
                                            : modal.feedrate;
-            while (plan_buffer_available() == 0) {
-                stepper_wake();
-                stepper_service_sync();
-                yield();
-            }
+            if (!wait_for_slot()) return STATUS_OVERFLOW;
             plan_buffer_line(tx, ty, fr, modal.motion == 0);
         } else if (modal.motion == 2 || modal.motion == 3) {
             // G2/G3: I/J are center offsets from current position (mm).

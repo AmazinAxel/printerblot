@@ -1,0 +1,223 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Permablot</title>
+  <link rel="icon" href="https://amazinaxel.com/favicon.ico">
+
+  <!-- Shared styling from amazinaxel.com, same sheets and load order as the
+       site's +layout.svelte, so the plotter UI restyles along with the site. -->
+  <link rel="preconnect" href="https://amazinaxel.com" crossorigin>
+  <link rel="stylesheet" href="https://amazinaxel.com/css/vars.css">
+  <link rel="stylesheet" href="https://amazinaxel.com/css/layout.css">
+  <link rel="stylesheet" href="https://amazinaxel.com/css/typography.css">
+  <link rel="stylesheet" href="https://amazinaxel.com/css/reset.css">
+  <link rel="stylesheet" href="https://amazinaxel.com/css/other.css">
+
+  <style>
+    /* typography.css declares its fonts as /fonts/*.woff2, which resolve
+       against the plotter's own origin and 404. Re-declare with absolute
+       URLs; these win because they come after the linked sheet. */
+    @font-face {
+      font-family: 'Hammersmith One'; font-style: normal; font-weight: 200;
+      font-display: swap;
+      src: url(https://amazinaxel.com/fonts/hammersmith-one.woff2) format('woff2');
+    }
+    @font-face {
+      font-family: 'Sora'; font-style: normal; font-display: swap;
+      src: url(https://amazinaxel.com/fonts/sora.woff2) format('woff2');
+    }
+
+    /* Page-specific bits the site sheets don't cover. */
+    #content { max-width: 40rem; padding-top: 2rem; }
+    h1 { text-align: center; }
+    h2 { font-size: 1.4rem; margin: 0 0 .75rem; }
+    .innerCard {
+      background: var(--darkest2); border: 1px solid var(--darkest4);
+      border-radius: 0.5rem; padding: 1rem; margin-bottom: 1rem;
+    }
+    .row { display: flex; flex-wrap: wrap; align-items: center; gap: .5rem 1.5rem; }
+    .stack { display: flex; flex-direction: column; gap: .75rem; }
+    label { display: inline-flex; align-items: center; gap: .4rem; font-size: 1rem; }
+    input[type=number] { width: 5.5rem; }
+    input[type=file] { color: var(--lightest3); font-size: .9rem; max-width: 100%; }
+    button.secondary { background: var(--darkest3); }
+    button.danger { background: var(--red); }
+    button:disabled { opacity: .5; cursor: default; }
+    #uplog, #status { font-size: .9rem; color: var(--lightest3); margin-top: .6rem; }
+    progress {
+      width: 100%; height: .5rem; margin-top: .6rem;
+      accent-color: var(--blue2);
+    }
+  </style>
+</head>
+<body>
+<div id="content">
+  <h1>Permablot</h1>
+
+  <!-- upload -->
+  <div class="innerCard">
+    <h2>Upload</h2>
+    <form id="up" class="stack">
+      <input type="file" name="pdf" accept="application/pdf,.gcode" required>
+      <div class="row">
+        <label>Threshold <input type="number" name="threshold" value="128" min="0" max="255"></label>
+        <label>Scale <input type="number" name="scale" value="1.0" step="0.1" min="0.1" max="1"></label>
+      </div>
+      <div class="row">
+        <label>DPI <input type="number" name="dpi" value="300" min="50" max="600"></label>
+        <label>Margin <input type="number" name="margin" value="2" step="0.5" min="0"></label>
+      </div>
+      <label>
+        <input type="checkbox" name="nocrop">
+        No crop
+      </label>
+      <div><button id="upbtn" type="submit">Convert &amp; upload</button></div>
+    </form>
+    <div id="uplog"></div>
+  </div>
+
+  <!-- machine control -->
+  <div class="innerCard">
+    <h2>Machine control</h2>
+    <span id="status"></span>
+    <progress id="prog" value="0" max="1" hidden></progress>
+    <div id="controls" class="row" style="margin-top:.6rem"></div>
+    <!-- Only shown while idle: quality applies to the next job, so changing
+         it mid-print would be misleading. -->
+    <div id="quality" class="row" style="margin-top:.9rem">
+      <label><input type="radio" name="q" value="draft"> Draft</label>
+      <label><input type="radio" name="q" value="poster"> Poster</label>
+    </div>
+  </div>
+</div>
+
+<script type="module">
+  // Served from the site, not the board: keeps the XIAO's flash and its
+  // uplink free for gcode. Update it there, not here.
+  import { convertPdf } from "https://amazinaxel.com/js/convert.js";
+
+  // pdf.js comes from a CDN rather than the board's flash: it's ~1.7MB, and
+  // serving that from an ESP32 would be slow and eat a third of the
+  // filesystem partition.
+  //
+  // Loaded lazily, on first PDF conversion, so that losing the CDN (offline,
+  // or on the AP fallback) still leaves the machine controls working — you
+  // can print an already-uploaded job or a .gcode file without internet.
+  const PDFJS = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.10.38";
+  let pdfjsReady = null;
+
+  function loadPdfJs() {
+    pdfjsReady ??= import(`${PDFJS}/pdf.min.mjs`).then((lib) => {
+      globalThis.pdfjsLib = lib;
+      lib.GlobalWorkerOptions.workerSrc = `${PDFJS}/pdf.worker.min.mjs`;
+    }).catch((e) => {
+      pdfjsReady = null; // let a later attempt retry
+      throw new Error("Couldn't load the PDF library — no internet? " +
+                      "You can still upload a .gcode file.");
+    });
+    return pdfjsReady;
+  }
+
+  const $ = (s) => document.querySelector(s);
+
+  async function post(url, body) {
+    const r = await fetch(url, body ? { method: "POST", body } : { method: "POST" });
+    return r.json().catch(() => ({}));
+  }
+
+  function render(s) {
+    const label = s.state === "idle" ? "Not running"
+                : s.state[0].toUpperCase() + s.state.slice(1);
+    // Only show the line counter while a job is actually going; "Not running
+    // — 0/13372 lines" reads like a stalled print rather than an idle machine.
+    $("#status").textContent =
+      (s.state === "idle")
+        ? (s.total ? `Ready — ${s.total} lines loaded` : "Ready")
+        : `${label} — ${s.done}/${s.total} lines`;
+
+    const prog = $("#prog");
+    if (s.state !== "idle" && s.total) {
+      prog.hidden = false;
+      prog.max = s.total;
+      prog.value = s.done;
+    } else {
+      prog.hidden = true;
+    }
+
+    // Quality applies to the next job, so hide it entirely while one runs
+    // rather than showing a control that can't do anything.
+    $("#quality").hidden = s.state !== "idle";
+    for (const el of document.getElementsByName("q")) {
+      el.checked = el.value === s.quality;
+    }
+
+    const c = $("#controls");
+    if (s.state === "idle") {
+      // No lock/unlock control: the motors are managed automatically —
+      // energised for a print, released the moment the machine stops.
+      c.innerHTML = '<button id="bprint">Print</button>';
+      $("#bprint").onclick = () => post("/print");
+    } else {
+      c.innerHTML =
+        '<button id="bpause" class="secondary"></button>' +
+        '<button id="bstop" class="danger">Stop</button>';
+      $("#bpause").textContent = s.state === "paused" ? "Resume" : "Pause";
+      $("#bpause").onclick = () => post("/pause");
+      $("#bstop").onclick = () => post("/stop");
+    }
+  }
+
+  for (const el of document.getElementsByName("q")) {
+    el.addEventListener("change", () =>
+      post("/quality", new URLSearchParams({ q: el.value })));
+  }
+
+  $("#up").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const form = $("#up");
+    const file = form.pdf.files[0];
+    if (!file) return;
+
+    $("#upbtn").disabled = true;
+    const log = (m) => ($("#uplog").textContent = m);
+
+    try {
+      let gcode;
+      if (file.name.toLowerCase().endsWith(".gcode")) {
+        // Already gcode — send as-is, no conversion needed.
+        log("Reading gcode…");
+        gcode = await file.text();
+      } else {
+        log("Loading PDF library…");
+        await loadPdfJs();
+        const res = await convertPdf(file, {
+          threshold: +form.threshold.value,
+          scale: +form.scale.value,
+          dpi: +form.dpi.value,
+          margin: +form.margin.value,
+          nocrop: form.nocrop.checked,
+        }, log);
+        gcode = res.gcode;
+        log(`Uploading ${res.paths} paths (${(gcode.length / 1024).toFixed(0)} KB)…`);
+      }
+
+      const body = new FormData();
+      body.append("gcode", new Blob([gcode], { type: "text/plain" }), "job.gcode");
+      const r = await post("/upload", body);
+      log(r.ok ? "Ready to print." : "Error: " + (r.error || "upload failed"));
+    } catch (err) {
+      log("Error: " + err.message);
+    } finally {
+      $("#upbtn").disabled = false;
+    }
+  });
+
+  const es = new EventSource("/events");
+  es.onmessage = (e) => render(JSON.parse(e.data));
+  fetch("/state").then((r) => r.json()).then(render).catch(() => {});
+</script>
+</body>
+</html>

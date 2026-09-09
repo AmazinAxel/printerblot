@@ -2,7 +2,41 @@
 
 #include <Arduino.h>
 
-// ───── Hardware pins (XIAO RP2040 + A4988 + servo) ─────
+// Code reached from the stepper ISR must live in RAM — a flash cache miss
+// (triggered by WiFi or LittleFS activity on the other core) would otherwise
+// stall step generation and show up as a stutter in the plot.
+#include "esp_attr.h"
+#include "soc/gpio_struct.h"
+#include "xtensa/core-macros.h"
+
+// Arduino's digitalWrite() and delayMicroseconds() live in FLASH on this core
+// (verified: 0x420116e8 and 0x42011768, outside the IRAM window). Calling
+// them from an ESP_INTR_FLAG_IRAM handler panics with "Cache disabled but
+// cached memory region accessed" as soon as anything writes to flash — which
+// LittleFS and the WiFi stack both do. The ISR must use these instead.
+
+// Write-1-to-set / write-1-to-clear: no read-modify-write, no races.
+static inline void IRAM_ATTR isr_pin_write(uint8_t pin, bool level) {
+    if (pin < 32) {
+        if (level) GPIO.out_w1ts = (1u << pin);
+        else       GPIO.out_w1tc = (1u << pin);
+    } else {
+        if (level) GPIO.out1_w1ts.val = (1u << (pin - 32));
+        else       GPIO.out1_w1tc.val = (1u << (pin - 32));
+    }
+}
+
+// Busy-wait on the cycle counter. Only used for the ~2µs A4988 step pulse.
+// F_CPU is 240MHz here; the count wraps but unsigned subtraction handles it.
+static inline void IRAM_ATTR isr_delay_us(uint32_t us) {
+    uint32_t start = XTHAL_GET_CCOUNT();
+    uint32_t cycles = us * (F_CPU / 1000000);
+    while ((XTHAL_GET_CCOUNT() - start) < cycles) { }
+}
+
+// ───── Hardware pins (XIAO ESP32-S3 + A4988 + servo) ─────
+// The D0-D10 aliases map to the same physical pads as the RP2040 XIAO this
+// replaced, so the Blot carrier board works unchanged.
 #define PIN_MOTOR1_STEP  D10
 #define PIN_MOTOR1_DIR   D9
 #define PIN_MOTOR2_STEP  D8
@@ -51,20 +85,20 @@
 
 // ───── Serial / protocol ─────
 #define SERIAL_BAUD         115200
-#define RX_BUFFER_SIZE       128         // GRBL convention
 #define LINE_BUFFER_SIZE     96
 
-// ───── GRBL-style error codes (subset we actually emit) ─────
+// ───── Error codes ─────
+// Numbering follows GRBL's so the values stay recognisable, but only the
+// codes this firmware actually emits are listed. tune.py just reports these
+// back to you as `error:<N>`; nothing parses them by meaning.
 enum StatusCode : uint8_t {
     STATUS_OK                  = 0,
     STATUS_EXPECTED_COMMAND    = 1,
     STATUS_BAD_NUMBER_FORMAT   = 2,
     STATUS_INVALID_STATEMENT   = 3,
     STATUS_NEGATIVE_VALUE      = 4,
-    STATUS_SETTING_DISABLED    = 5,
     STATUS_UNSUPPORTED_COMMAND = 20,
     STATUS_MODAL_GROUP_CONFLICT= 21,
-    STATUS_INVALID_TARGET      = 31,
     STATUS_ARC_RADIUS_ERROR    = 33,
     STATUS_OVERFLOW            = 60,
 };
@@ -74,4 +108,3 @@ enum StatusCode : uint8_t {
 #define RT_FEED_HOLD       '!'
 #define RT_CYCLE_START     '~'
 #define RT_SOFT_RESET      0x18   // ctrl-X
-#define RT_JOG_CANCEL      0x85   // GRBL 1.1: abort any in-flight jog

@@ -2,18 +2,33 @@
 
 A modified version of [Sam's updated Blot firmware](https://github.com/samdev-7/upgraded-blot), intended more for document/flier printing with speed and precision
 
+It uses a Seeed XIAO ESP32-S3 instead of the RP2040, which allows you to control it from a web interface!
+
 ## Hardware
 
-We're reusing the same hardware from [Blot](https://github.com/hackclub/blot), but there is a magnetic paper attachment with these [guide rails](https://cad.onshape.com/documents/e4d5e6d129eb20e428115785/w/b41a37e6be291bfad55ecd9b/e/578fac4d719cb84d5432b5e6?renderMode=0&uiState=6a8a94e45d478301f2f15755) that I've designed which helps for printing stability. 
+We're reusing the same hardware from [Blot](https://github.com/hackclub/blot), but there is a magnetic paper attachment with these [guide rails](https://cad.onshape.com/documents/e4d5e6d129eb20e428115785/w/b41a37e6be291bfad55ecd9b/e/578fac4d719cb84d5432b5e6?renderMode=0&uiState=6a8a94e45d478301f2f15755) that I've designed which helps for printing stability! A printable version is in [`Printerblot_rails_v1.stl`](Printerblot_rails_v1.stl)
 
-## Firmware flashing
+## How it's improved
 
-Unlike the upstream firmware, you have to flash this with [PlatformIO](https://platformio.org/) instead of the Arduino IDE.
+The webserver hosted on the ESP32-S3 boots as soon as you plug in the Blot. You can access it without remembering an IP, just go to `<your configured name>.local` in your web browser. You can upload a PDF there and it converts it to gcode in the browser, sending only the gcode to the Blot. That's stored in the device's flash, so you can reprint the same file without re-uploading it, and because the S3 has a second core you can upload one job while another prints so it's really fast and no connected computer is required.
 
-Plug in your Blot and hold the B button on the Xiao (you only need to do this if this is the first flash), then run `pio run -t upload` and you're done! You can use the utilities in `tools/` to send raw gcode (through `term.py`), or turn a pdf to gcode (`pdf2gcode.py`) and stream that (`stream.py`). If you're on Nix, you can use the devshell: `nix develop`
+The firmware also manages the hardware more carefully than the original with better motor handling, pen servo handling and networking radio which cut idle power and heat so you can leave the blot plugged in.
 
-## On a Pi
+## Setup
 
-You can optionally hook up a button to a Pi (on header pins 5 and 6) and install the Nix flake ((Permablot host))[https://github.com/AmazinAxel/flake] so you don't need a laptop! The Pi exposes a webserver where you can upload a PDF and adjust some printer settings and sleep the Pi. The gpio button can be used to start, stop, and pause prints and can even be used to cancel prints or shutdown the Pi. It runs well on a Zero W or a Zero 2W.
+Make `src/wifi_config.h` and put in your config:
 
-To install, clone my Nix flake and build an iso to flash to an SD card: `nixos-rebuild build-image --image-variant sd --flake .#permablot` (if you are installing it on a PC or a non-SD device, replace `sd` with `iso`).
+```c
+#pragma once
+
+#define WIFI_SSID  ""
+#define WIFI_PASS  ""
+#define MDNS_NAME  "permablot"
+```
+
+```sh
+pio run -t upload   # firmware
+pio run -t uploadfs # web stuff
+```
+
+Then open `http://<MDNS name here>.local/` in your web browser!!

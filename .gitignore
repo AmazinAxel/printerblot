@@ -12,10 +12,14 @@ compile_commands.json
 
 .claude
 
-# Runtime state (lives in /var/lib/blotd in prod, never committed)
-state.json
-lastJob.gcode
-lastUploadedPDF.*
-*.tmp
+# Python tooling
 __pycache__/
 *.pyc
+*.tmp
+
+# Gcode produced by tools/pdf2gcode.py
+*.gcode
+
+# Secrets: wifi credentials are compiled into the firmware, so the real
+# header stays out of git. Use src/wifi_config.h.example as a template.
+src/wifi_config.h

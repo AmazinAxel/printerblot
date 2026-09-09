@@ -63,12 +63,14 @@ uint8_t plan_buffer_available() {
     return (uint8_t)free;
 }
 
-plan_block_t *plan_get_current_block() {
+// Called from the stepper ISR, so both of these must live in IRAM on ESP32:
+// a flash cache miss here would stall step generation.
+plan_block_t *IRAM_ATTR plan_get_current_block() {
     if (buffer_head == buffer_tail) return nullptr;
     return &block_buffer[buffer_tail];
 }
 
-void plan_discard_current_block() {
+void IRAM_ATTR plan_discard_current_block() {
     if (buffer_head == buffer_tail) return;
     uint8_t old_tail = buffer_tail;
     buffer_tail = next_index(buffer_tail);
@@ -263,10 +265,20 @@ static void compute_trapezoid(plan_block_t *b) {
 static void planner_recalculate() {
     if (buffer_head == buffer_tail) return;
 
+    // The block the stepper is mid-way through must not be re-planned. Its
+    // ramp is already partly executed, so changing initial_rate or
+    // accelerate_until now would step the velocity discontinuously — audible
+    // as a click and visible as a mark on the paper. GRBL has the same rule.
+    // Note this is a snapshot: the ISR can finish the block right after we
+    // read it, which is harmless (we'd merely skip re-planning a block that
+    // no longer needs it, and the next enqueue re-runs this anyway).
+    const plan_block_t *executing = stepper_active_block();
+
     uint8_t last = prev_index(buffer_head);   // newest block
     if (last == buffer_tail) {
         // Only one block in buffer. Entry = max_entry, exit = 0.
         plan_block_t *b = &block_buffer[last];
+        if (b == executing) return;
         b->entry_speed = fminf(b->max_entry_speed, b->nominal_speed);
         compute_trapezoid(b);
         buffer_planned = last;
@@ -287,6 +299,9 @@ static void planner_recalculate() {
             break;
         plan_block_t *cur  = &block_buffer[idx];
         plan_block_t *prev = &block_buffer[pidx];
+
+        // Reached the in-flight block: its entry speed is history now.
+        if (prev == executing) break;
 
         // Max entry into prev such that it can decelerate to cur->entry over prev->length.
         float v_reach_sq = cur->entry_speed * cur->entry_speed
@@ -327,7 +342,10 @@ static void planner_recalculate() {
             }
         }
 
-        compute_trapezoid(cur);
+        // Still clamp the *next* block above (the executing block really does
+        // limit what its successor can enter at), but never rewrite the
+        // trapezoid of the block being stepped.
+        if (cur != executing) compute_trapezoid(cur);
         idx = nidx;
     }
 
@@ -401,21 +419,6 @@ bool plan_buffer_line(float x_target, float y_target,
     planner_recalculate();
     return true;
 }
-
-#ifdef FIRMWARE_TEST
-// Test-only accessor: returns a pointer to the (offset)-th queued block,
-// counting from the tail (oldest). Returns nullptr if offset is past head.
-extern "C" plan_block_t *block_buffer_get(uint8_t offset) {
-    uint8_t idx = (buffer_tail + offset) & (PLANNER_BUFFER_SIZE - 1);
-    // Walk from tail to head; if we reach head before offset, it's out of range.
-    uint8_t walk = buffer_tail;
-    for (uint8_t i = 0; i < offset; i++) {
-        walk = next_index(walk);
-        if (walk == buffer_head) return nullptr;
-    }
-    return &block_buffer[idx];
-}
-#endif
 
 bool plan_sync_command(uint8_t cmd, int32_t arg) {
     if (next_index(buffer_head) == buffer_tail) return false;

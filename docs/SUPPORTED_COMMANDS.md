@@ -4,7 +4,9 @@
 
 Quick reference for what this firmware accepts. Anything not listed here returns `error:20` (unsupported command).
 
-The firmware advertises itself as `Grbl 1.1f` on connect so standard GRBL senders (UGS, bCNC, OctoPrint + GRBL plugin) recognize it. `$I` returns `[VER:1.1f.Blot:]`.
+**Compatibility with third-party GRBL senders (UGS, bCNC, OctoPrint) was deliberately removed.** There's no welcome banner, no `$I`/`$G`/`$J=`/`$X`/`$H`/`$C`/`$N`/`$SLP`, no `$0`-`$32` stub settings, and no `Z` field in `MPos`. Printing happens through the on-board web UI, and the only program that speaks this serial protocol is the vendored [`tune.py`](../tune.py).
+
+The error codes and setting numbers still follow GRBL's numbering, because it's a reasonable convention and keeps the values recognizable — not because anything depends on it.
 
 ---
 
@@ -46,14 +48,17 @@ Origin `(0, 0)` is the bottom-left corner of the work area. `+X` is right, `+Y` 
 
 | Code       | Meaning                                                         |
 |------------|-----------------------------------------------------------------|
-| `M3 S<us>` | Pen down. `S` is the servo pulse width in microseconds (default 1700 µs). Sync-queued: fires in order with motion |
+| `M3 S<us>` | Pen down. `S` is the servo pulse width in microseconds (default 1350 µs). Sync-queued: fires in order with motion |
 | `M5`       | Pen up (returns to `$150` pulse width, default 1000 µs)         |
 
 ### Pen notes
 
-- There's a ~150 ms dwell after each servo command so the mechanical lift/drop completes before motion resumes.
+- There's a 60 ms dwell after each servo command so the mechanical lift/drop completes before motion resumes.
 - `M3` without `S` uses the last-commanded / persisted down value.
 - `M3 S<us>` persists its pulse width to flash (as `$151`), so your calibrated down position survives power cycles.
+- `S` is clamped to 500–2500 µs.
+- The pulse train stops ~400 ms after the pen arrives, so the servo stops
+  buzzing and hunting between commands. The next `M3`/`M5` restarts it.
 
 ---
 
@@ -66,6 +71,15 @@ Origin `(0, 0)` is the bottom-left corner of the work area. `+X` is right, `+Y` 
 | `M0` / `M1`    | Program pause — triggers feed hold, release with `~`         |
 | `M2` / `M30`   | Program end — no-op (no spindle/coolant to turn off)         |
 
+Both `M17` and `M18` are sync-queued, so they take effect in order with
+motion rather than the moment they're parsed.
+
+**Automatic motor power management.** The firmware sends `M18` for you as
+soon as the planner drains and the stepper goes idle — a stationary energised
+stepper just heats up for no benefit on a machine with no gravity load. Any
+motion command re-enables the drivers automatically (also sync-queued), so
+you rarely need either code by hand.
+
 ---
 
 ## Settings (`$` commands)
@@ -73,30 +87,37 @@ Origin `(0, 0)` is the bottom-left corner of the work area. `+X` is right, `+Y` 
 | Command         | Returns / does                                                |
 |-----------------|---------------------------------------------------------------|
 | `$`  or `$$`    | Dump all settings                                             |
-| `$I`            | Build info — `[VER:1.1f.Blot:]` and `[OPT:V,16,128]`          |
-| `$G`            | Parser state — current modal block                            |
 | `$N=<value>`    | Set setting `N` (see table below)                             |
 | `$RST=*`        | Reset all settings to compile-time defaults (also `$RST=$`, `$RST=#`) |
-| `$X`            | Clear alarm — no-op `ok` (we have no alarm state)             |
-| `$H`            | *Not supported* (no limit switches on Blot)                   |
-| `$J=<motion>`   | Jog — one-shot move with temporary modal scope (see below)    |
+
+Anything else beginning with `$` returns `error:3` (invalid statement) or
+`error:20`. The sender-oriented commands (`$I`, `$G`, `$J=`, `$X`, `$H`,
+`$C`, `$N`, `$SLP`) were removed along with GRBL sender support.
 
 ### Tunable settings
 
 | `$N` | Name                  | Default   | Units       |
 |------|-----------------------|-----------|-------------|
-| `$100` | `steps_per_mm`        | `80.000`  | steps/mm    |
-| `$110` | `max_feedrate`        | `1500`    | mm/min (Cartesian tip cap) |
-| `$111` | `max_rapid_rate`      | `1500`    | mm/min (G0 rapid cap) |
-| `$112` | `motor_max_rate`      | `1500`    | mm/min (motor-space physical cap) |
-| `$120` | `max_acceleration`    | `200`     | mm/s² (Cartesian tip) |
-| `$122` | `motor_max_accel`     | `500`     | mm/s² (motor-space physical cap) |
-| `$130` | `max_travel_x`        | `125`     | mm (documentation only; not soft-limit-enforced yet) |
-| `$131` | `max_travel_y`        | `125`     | mm |
+| `$100` | `steps_per_mm`        | `80.000`  | steps/mm *(read-only — compile-time)* |
+| `$110` | `max_feedrate`        | `16402`   | mm/min (Cartesian tip cap) |
+| `$111` | `max_rapid_rate`      | `16401`   | mm/min (G0 rapid cap) |
+| `$112` | `motor_max_rate`      | `16402`   | mm/min (motor-space physical cap) |
+| `$120` | `max_acceleration`    | `16606`   | mm/s² (Cartesian tip) |
+| `$122` | `motor_max_accel`     | `16606`   | mm/s² (motor-space physical cap) |
+| `$130` | `max_travel_x`        | `125`     | mm (documentation only; not soft-limit-enforced) |
+| `$131` | `max_travel_y`        | `125`     | mm (documentation only) |
 | `$140` | `junction_deviation`  | `0.05`    | mm — corner tolerance; smaller ⇒ tighter corners, slower cornering |
 | `$141` | `arc_tolerance`       | `0.002`   | mm — max chord deviation from true arc |
 | `$150` | `servo_pen_up_us`     | `1000`    | µs |
-| `$151` | `servo_pen_down_us`   | `1700`    | µs |
+| `$151` | `servo_pen_down_us`   | `1350`    | µs |
+
+The compile-time defaults above are the *measured limits of this specific
+machine* (what `tune.py` found), not conservative starting values. On a
+different Blot, re-run the tuning procedure before trusting them.
+
+`$100`/`$101` are reported but read-only — steps/mm is a compile-time
+constant (`STEPS_PER_MM`). `$121` mirrors `$120` and `$101` mirrors `$100`;
+the axes aren't independently configurable on a CoreXY machine.
 
 **Two tiers for speed and accel.** `$110`/`$120` cap the Cartesian tool-path
 values; `$112`/`$122` cap motor-space values. The planner takes the minimum
@@ -110,16 +131,11 @@ Settings are **persisted to flash** (EEPROM emulation). After a `$N=` command,
 the change is held in RAM and written to flash **~500 ms later, once the
 stepper is idle** — so rapid-fire `$N=` bursts (from tuning scripts, say)
 are coalesced into a single flash write rather than one per command. This
-stops flash-erase stalls from locking up the main loop and causing serial
-sync issues with senders like UGS.
+stops flash-erase stalls from locking up the main loop and stealing time from
+the parser.
 
-### `$J=` jog
-
-One-shot move used by senders for arrow-key / step jogging. The text after `=` is parsed as a motion line; any `G90/G91/G20/G21` inside the jog applies *only* to that jog and does not leak into subsequent lines.
-
-- `$J=G91X1F300` — jog +1 mm in X at 300 mm/min
-- `$J=G91X-1Y1F500` — diagonal jog
-- `$J=G90X50Y50F1000` — absolute jog to (50, 50)
+An identical-value write is skipped entirely, so re-sending the same quality
+preset from the web UI doesn't burn an erase cycle.
 
 ### `$RST=*` — reset to defaults
 
@@ -140,11 +156,14 @@ These bytes are intercepted *before* the line parser — they work at any time, 
 
 | Byte    | Name         | Action                                           |
 |---------|--------------|--------------------------------------------------|
-| `?`     | Status       | Emit `<State|MPos:x,y,0.000|FS:feed,0>` immediately (Z always 0 for UGS compat) |
+| `?`     | Status       | Emit `<State|MPos:x,y|FS:feed,0>` immediately    |
 | `!`     | Feed hold    | Decelerate to zero, hold the planner buffer      |
 | `~`     | Cycle start  | Resume after hold / release a `M0`/`M1` pause    |
-| `0x18`  | Soft reset   | Flush planner, clear line buffer, re-emit welcome |
-| `0x85`  | Jog cancel   | Abort any in-flight jog and flush the planner    |
+| `0x18`  | Soft reset   | Flush planner, clear line buffer (motor position is preserved) |
+
+> **`!` needs a matching `~`.** While the machine is held, a parser waiting
+> for a free planner slot gives up and returns `error:60` rather than
+> blocking — the buffer can't drain until you resume.
 
 ### Status states
 

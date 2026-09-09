@@ -57,11 +57,11 @@ void settings_load() {
 
 // ───── debounced / idle-gated save ─────
 //
-// EEPROM.commit() on RP2040 erases and rewrites a whole flash sector — it's
-// blocking, takes tens of milliseconds, and leaves the main loop unable to
-// service realtime serial commands (like `?`) while it runs. Back-to-back
-// $N= commands (e.g. what the tuning script sends) used to fire a commit
-// per command, which piled up and made UGS think the port was stuck.
+// EEPROM.commit() erases and rewrites a whole flash sector — it's blocking,
+// takes tens of milliseconds, and leaves the main loop unable to service
+// realtime serial commands (like `?`) while it runs. Back-to-back $N=
+// commands (e.g. what the tuning script sends) used to fire a commit per
+// command, which piled up and made UGS think the port was stuck.
 //
 // Now we just mark a dirty bit and let settings_service_save() flush once
 // the stepper is idle AND some time has passed since the last change.
@@ -92,6 +92,15 @@ static void do_flash_write() {
     s.arc_tolerance_mm        = planner_arc_tolerance_mm;
     s.pen_up_us               = servo_pen_up_us;
     s.pen_down_us             = servo_pen_down_us;
+
+    // Skip the write when nothing actually changed. Flash endurance is finite
+    // (~100k erase cycles) and the web UI re-sends the whole quality preset on
+    // every toggle, so without this a few hundred UI clicks would each burn an
+    // erase cycle for identical data.
+    SavedSettings cur;
+    EEPROM.get(0, cur);
+    if (memcmp(&cur, &s, sizeof(s)) == 0) return;
+
     EEPROM.put(0, s);
     EEPROM.commit();
 }
@@ -117,7 +126,12 @@ void settings_service_save() {
     if ((int32_t)(now - _dirty_since_ms) < (int32_t)SAVE_DEBOUNCE_MS) return;
     // Avoid stalling in-progress motion — a flash erase can freeze the
     // main loop for ~50 ms, during which realtime serial goes unanswered.
-    if (!stepper_is_idle()) return;
+    //
+    // stepper_is_idle() alone isn't enough: it's momentarily true between
+    // blocks while the planner still holds queued motion, so a commit could
+    // land in a gap mid-print and starve the parser that should be refilling
+    // the buffer. Require the whole pipeline to be empty.
+    if (!stepper_is_idle() || !plan_is_empty()) return;
 
     _dirty = false;  // clear first, so a subsequent change during the
                      // commit re-raises it and gets saved next cycle.

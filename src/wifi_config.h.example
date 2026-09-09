@@ -1,0 +1,11 @@
+// Copy to src/wifi_config.h and fill in. wifi_config.h is gitignored.
+//
+//   cp src/wifi_config.h.example src/wifi_config.h
+//
+#pragma once
+
+#define WIFI_SSID  ""
+#define WIFI_PASS  ""
+
+// mDNS name: reach the board at http://permablot.local/
+#define MDNS_NAME  "permablot"
