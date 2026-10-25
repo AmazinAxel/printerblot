@@ -150,31 +150,25 @@ def optimize_path_order(contours):
     if len(contours) <= 1:
         return contours
 
-    remaining = list(range(len(contours)))
-    ordered = [remaining.pop(0)]
-    current_end = contours[ordered[0]][-1]
+    # Vectorized: one numpy pass per pick instead of a Python loop over every
+    # remaining contour, which made big PDFs take minutes on a Pi Zero.
+    starts = np.array([c[0] for c in contours])
+    ends = np.array([c[-1] for c in contours])
+    used = np.zeros(len(contours), dtype=bool)
+    used[0] = True
+    ordered = [0]
+    current_end = ends[0]
 
-    while remaining:
-        best_idx = None
-        best_dist = float("inf")
-        best_reversed = False
-
-        for i, ri in enumerate(remaining):
-            c = contours[ri]
-            d_start = np.linalg.norm(current_end - c[0])
-            d_end = np.linalg.norm(current_end - c[-1])
-
-            if d_start < best_dist:
-                best_dist = d_start
-                best_idx = i
-                best_reversed = False
-            if d_end < best_dist:
-                best_dist = d_end
-                best_idx = i
-                best_reversed = True
-
-        ri = remaining.pop(best_idx)
-        if best_reversed:
+    for _ in range(len(contours) - 1):
+        d = np.column_stack([
+            np.hypot(*(starts - current_end).T),
+            np.hypot(*(ends - current_end).T),
+        ])
+        d[used] = np.inf
+        # Row-major argmin: lowest index first, start before end on ties.
+        ri, reverse = divmod(int(np.argmin(d)), 2)
+        used[ri] = True
+        if reverse:
             contours[ri] = contours[ri][::-1]
         ordered.append(ri)
         current_end = contours[ri][-1]
@@ -236,7 +230,7 @@ def contours_to_gcode(contours, img_width, img_height,
         if len(contour) < 2:
             continue
 
-        mm_points = np.array([to_mm(p[0], p[1]) for p in contour])
+        mm_points = np.column_stack(to_mm(contour[:, 0], contour[:, 1]))
 
         # Simplify to reduce point count
         mm_points = simplify_path(mm_points, SIMPLIFY_TOL_MM)
@@ -289,7 +283,7 @@ def main():
     ap.add_argument("--dpi", type=int, default=300,
                     help="PDF render resolution (default: 300, higher = finer detail)")
     ap.add_argument("--speed", type=int, default=None,
-                    help="Drawing speed in mm/min (default: 2000, lower = sharper)")
+                    help="Drawing speed in mm/min (default: 4000, lower = sharper)")
     ap.add_argument("--margin", type=float, default=2.0,
                     help="Margin in mm around the drawing (default: 2)")
     ap.add_argument("--no-crop", action="store_true",

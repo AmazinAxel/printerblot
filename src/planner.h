@@ -40,6 +40,9 @@ typedef struct {
     uint32_t accel_st;              // step events / s² in step-event space
     uint32_t accelerate_until;      // step-event index where accel ends
     uint32_t decelerate_after;      // step-event index where decel begins
+    // step_event_count / L in 1/256 units (≤ ~29000), 0 for sync blocks. Lets
+    // the ISR carry a feed-hold decel into the next block with integer math.
+    uint32_t events_per_mm_q8;
 
     // Synchronized side-effect (executed after this block's motion completes)
     uint8_t  sync_cmd;

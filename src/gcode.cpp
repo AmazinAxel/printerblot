@@ -1,6 +1,7 @@
 #include "gcode.h"
 #include "planner.h"
 #include "stepper.h"
+#include "protocol.h"
 #include "arc.h"
 #include "settings.h"
 #include <ctype.h>
@@ -119,11 +120,21 @@ static StatusCode tokenize(char *s, Line *ln) {
         char *endp = nullptr;
         float v = 0.0f;
         if (!parse_number(p, &endp, &v)) return STATUS_BAD_NUMBER_FORMAT;
+        // Rounding a decimal code would silently run a different command —
+        // G92.1 (clear offsets) as G92 (set them). G92.1 is the only one we
+        // implement, stored as 921; any other decimal code is unsupported.
+        bool whole = fabsf(v - roundf(v)) < 1e-3f;
         if (letter == 'G') {
             if (ln->g_count >= 8) return STATUS_MODAL_GROUP_CONFLICT;
-            ln->g_codes[ln->g_count++] = (int)lroundf(v);
+            int g = (int)lroundf(v);
+            if (!whole) {
+                if (lroundf(v * 10.0f) != 921) return STATUS_UNSUPPORTED_COMMAND;
+                g = 921;
+            }
+            ln->g_codes[ln->g_count++] = g;
         } else if (letter == 'M') {
             if (ln->m_count >= 4) return STATUS_MODAL_GROUP_CONFLICT;
+            if (!whole) return STATUS_UNSUPPORTED_COMMAND;
             ln->m_codes[ln->m_count++] = (int)lroundf(v);
         } else {
             ln->val[letter - 'A'] = v;
@@ -187,22 +198,35 @@ static StatusCode handle_dollar(char *line) {
     // Trailing garbage after the number is a format error too.
     if (*vend != '\0') return STATUS_BAD_NUMBER_FORMAT;
     if (v < 0.0f && id != 130 && id != 131) return STATUS_NEGATIVE_VALUE;
+    // Speeds and accelerations are divisors in the planner.
+    bool divisor = id == 110 || id == 111 || id == 112 || id == 120 || id == 122;
+    if (divisor && v <= 0.0f) return STATUS_INVALID_STATEMENT;
+    // Only an actual change is persisted: the web UI re-sends the whole
+    // quality preset on every toggle, and each save is a flash sector erase.
+    bool changed = false;
+    auto setf = [&](float &dst) { changed = dst != v; dst = v; };
+    auto seti = [&](int &dst) { changed = dst != (int)v; dst = (int)v; };
     switch (id) {
-        case 20:  planner_soft_limits_enabled    = (v != 0.0f); break;
-        case 110: planner_max_feedrate_mm_min    = v; break;
-        case 111: planner_max_rapid_mm_min       = v; break;
-        case 112: planner_motor_max_rate_mm_min  = v; break;
-        case 120: planner_max_accel_mm_s2        = v; break;
-        case 122: planner_motor_max_accel_mm_s2  = v; break;
-        case 130: work_area_max_x_mm             = v; break;
-        case 131: work_area_max_y_mm             = v; break;
-        case 140: planner_junction_deviation_mm  = v; break;
-        case 141: planner_arc_tolerance_mm       = v; break;
-        case 150: servo_pen_up_us                = (int)v; break;
-        case 151: servo_pen_down_us              = (int)v; break;
+        case 20: {
+            bool on = v != 0.0f;
+            changed = planner_soft_limits_enabled != on;
+            planner_soft_limits_enabled = on;
+            break;
+        }
+        case 110: setf(planner_max_feedrate_mm_min);    break;
+        case 111: setf(planner_max_rapid_mm_min);       break;
+        case 112: setf(planner_motor_max_rate_mm_min);  break;
+        case 120: setf(planner_max_accel_mm_s2);        break;
+        case 122: setf(planner_motor_max_accel_mm_s2);  break;
+        case 130: setf(work_area_max_x_mm);             break;
+        case 131: setf(work_area_max_y_mm);             break;
+        case 140: setf(planner_junction_deviation_mm);  break;
+        case 141: setf(planner_arc_tolerance_mm);       break;
+        case 150: seti(servo_pen_up_us);                break;
+        case 151: seti(servo_pen_down_us);              break;
         default: return STATUS_UNSUPPORTED_COMMAND;
     }
-    settings_mark_dirty();  // persisted lazily when idle + debounced
+    if (changed) settings_mark_dirty();  // persisted lazily when idle + debounced
     return STATUS_OK;
 }
 
@@ -212,7 +236,7 @@ static StatusCode apply_modal(Line *ln) {
     // Distinguish group 1 motion (G0/G1/G2/G3/G28), group 6 units (G20/G21),
     // group 3 distance (G90/G91), non-modal (G4, G92).
     bool motion_set = false, units_set = false, dist_set = false;
-    int  non_modal = 0;  // 0=none, 4, 28, 92
+    int  non_modal = 0;  // 0=none, 4, 28, 92, 921 (G92.1)
 
     for (uint8_t i = 0; i < ln->g_count; i++) {
         int g = ln->g_codes[i];
@@ -238,9 +262,9 @@ static StatusCode apply_modal(Line *ln) {
             case 91:
                 if (dist_set) return STATUS_MODAL_GROUP_CONFLICT;
                 modal.distance = 91; dist_set = true; break;
-            case 92:
+            case 92: case 921:
                 if (non_modal) return STATUS_MODAL_GROUP_CONFLICT;
-                non_modal = 92; break;
+                non_modal = g; break;
             default:
                 return STATUS_UNSUPPORTED_COMMAND;
         }
@@ -262,20 +286,14 @@ static StatusCode apply_modal(Line *ln) {
     // pattern. The motion path already waits this way; sync commands
     // should behave the same.
     //
-    // Bails out in feed hold instead of spinning. A held stepper never drains
-    // the buffer, and nothing inside this loop can read the `~` that would
-    // release it — so without the check, `!` (or M0) with a full planner
-    // hangs the parser until the 30s watchdog reboots mid-print. The caller
-    // turns a false return into error:60, which is recoverable.
-    auto wait_for_slot = [&]() -> bool {
-        while (plan_buffer_available() == 0) {
-            if (stepper_is_in_hold()) return false;
-            stepper_wake();
-            stepper_service_sync();
-            yield();  // service USB so Linux doesn't reset us
-        }
-        return true;
-    };
+    // In feed hold the wait gives up instead of spinning until the 30s
+    // watchdog reboots mid-print; that becomes error:60, which is
+    // recoverable. A reset arriving meanwhile aborts the line; its status is
+    // never sent.
+#define WAIT_FOR_SLOT() do { \
+        if (!protocol_wait_for_planner_slot()) \
+            return protocol_reset_pending() ? STATUS_OK : STATUS_OVERFLOW; \
+    } while (0)
 
     // M-codes: pen (M3/M5), motors (M17/M18), pause/end (M0/M2).
     for (uint8_t i = 0; i < ln->m_count; i++) {
@@ -289,24 +307,24 @@ static StatusCode apply_modal(Line *ln) {
                     settings_mark_dirty();
                 }
                 modal.pen_down = true;
-                if (!wait_for_slot()) return STATUS_OVERFLOW;
+                WAIT_FOR_SLOT();
                 if (!plan_sync_command(SYNC_SERVO, us)) return STATUS_OVERFLOW;
                 break;
             }
             case 5: {
                 modal.pen_down = false;
-                if (!wait_for_slot()) return STATUS_OVERFLOW;
+                WAIT_FOR_SLOT();
                 if (!plan_sync_command(SYNC_SERVO, servo_pen_up_us))
                     return STATUS_OVERFLOW;
                 break;
             }
             case 17:
-                if (!wait_for_slot()) return STATUS_OVERFLOW;
+                WAIT_FOR_SLOT();
                 if (!plan_sync_command(SYNC_SET_ENABLE, 1)) return STATUS_OVERFLOW;
                 drivers_enabled = true;
                 break;
             case 18: case 84:
-                if (!wait_for_slot()) return STATUS_OVERFLOW;
+                WAIT_FOR_SLOT();
                 if (!plan_sync_command(SYNC_SET_ENABLE, 0)) return STATUS_OVERFLOW;
                 drivers_enabled = false;
                 break;
@@ -328,7 +346,7 @@ static StatusCode apply_modal(Line *ln) {
         if (line_has(ln, 'P')) ms = (int32_t)line_get(ln, 'P');
         else if (line_has(ln, 'S')) ms = (int32_t)(line_get(ln, 'S') * 1000.0f);
         if (ms < 0) ms = 0;
-        if (!wait_for_slot()) return STATUS_OVERFLOW;
+        WAIT_FOR_SLOT();
         if (!plan_sync_command(SYNC_DWELL, ms)) return STATUS_OVERFLOW;
     }
 
@@ -349,6 +367,12 @@ static StatusCode apply_modal(Line *ln) {
         }
     }
 
+    // G92.1: clear the G92 offsets; work coordinates = machine coordinates.
+    if (non_modal == 921) {
+        modal.offset[0] = 0.0f;
+        modal.offset[1] = 0.0f;
+    }
+
     // G28: move to (0, 0) in work coordinates
     if (non_modal == 28) {
         float tx = modal.offset[0];
@@ -356,7 +380,7 @@ static StatusCode apply_modal(Line *ln) {
         // The G92 origin can itself sit outside the envelope, so G28 is not
         // implicitly safe — check it like any other move.
         if (!plan_target_in_bounds(tx, ty)) return STATUS_TRAVEL_EXCEEDED;
-        if (!wait_for_slot()) return STATUS_OVERFLOW;
+        WAIT_FOR_SLOT();
         if (!plan_buffer_line(tx, ty, planner_max_rapid_mm_min, true))
             return STATUS_OVERFLOW;
     }
@@ -374,7 +398,7 @@ static StatusCode apply_modal(Line *ln) {
         // later line was parsed. `drivers_enabled` keeps this to one sync
         // block per M18→motion transition instead of one per motion line.
         if (!drivers_enabled) {
-            if (!wait_for_slot()) return STATUS_OVERFLOW;
+            WAIT_FOR_SLOT();
             if (!plan_sync_command(SYNC_SET_ENABLE, 1)) return STATUS_OVERFLOW;
             drivers_enabled = true;
         }
@@ -408,7 +432,7 @@ static StatusCode apply_modal(Line *ln) {
             // Check bounds before waiting for a slot: an out-of-range move
             // should report immediately, not block until the buffer drains.
             if (!plan_target_in_bounds(tx, ty)) return STATUS_TRAVEL_EXCEEDED;
-            if (!wait_for_slot()) return STATUS_OVERFLOW;
+            WAIT_FOR_SLOT();
             plan_buffer_line(tx, ty, fr, modal.motion == 0);
         } else if (modal.motion == 2 || modal.motion == 3) {
             // G2/G3: I/J are center offsets from current position (mm).

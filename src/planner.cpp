@@ -129,9 +129,14 @@ static void populate_geometry(plan_block_t *b,
         float inv_L = 1.0f / length_mm;
         b->unit_vec[0] = dx * inv_L;
         b->unit_vec[1] = dy * inv_L;
+        // Real moves are ≤ 80·√2 events/mm; the cap only bites on sub-step
+        // slivers and keeps rate × this inside 32 bits in the ISR.
+        float q8 = (float)b->step_event_count * 256.0f * inv_L;
+        b->events_per_mm_q8 = q8 > 65535.0f ? 65535u : (uint32_t)q8;
     } else {
         b->unit_vec[0] = 0.0f;
         b->unit_vec[1] = 0.0f;
+        b->events_per_mm_q8 = 0;
     }
 }
 
@@ -186,7 +191,12 @@ static float junction_speed(const float v_in[2], const float v_out[2],
 // can be recomputed too (e.g. to extend cruise when a new block arrives),
 // so the final field-write burst is bracketed by noInterrupts/interrupts
 // to keep the stepper from catching a half-updated state.
-static void compute_trapezoid(plan_block_t *b) {
+//
+// Returns false, leaving the block untouched, if the stepper is already in
+// this block's deceleration: moving the decel point later from there would
+// jump the rate back up. Its exit speed is then fixed and the caller must not
+// plan the next block faster than it.
+static bool compute_trapezoid(plan_block_t *b) {
     if (b->step_event_count == 0) {
         noInterrupts();
         b->initial_rate = 0;
@@ -197,7 +207,7 @@ static void compute_trapezoid(plan_block_t *b) {
         b->decelerate_after = 0;
         b->recalculate_flag = false;
         interrupts();
-        return;
+        return true;
     }
 
     float L = b->millimeters;
@@ -250,6 +260,11 @@ static void compute_trapezoid(plan_block_t *b) {
     // Atomic swap — a running stepper ISR must never see a half-updated
     // mix of old rate fields and new phase breakpoints.
     noInterrupts();
+    uint32_t done;
+    if (stepper_is_executing(b, &done) && done >= b->decelerate_after) {
+        interrupts();
+        return false;
+    }
     b->initial_rate       = new_initial_rate;
     b->nominal_rate       = new_nominal_rate;
     b->final_rate         = new_final_rate;
@@ -258,6 +273,16 @@ static void compute_trapezoid(plan_block_t *b) {
     b->decelerate_after   = new_decelerate_after;
     b->recalculate_flag   = false;
     interrupts();
+    return true;
+}
+
+// The newest block has nothing after it, so it must be able to stop within
+// its own length: v_entry² <= 2·a·L. Without this cap a short final segment
+// planned at full junction speed starts its decel ramp below the speed it is
+// entered at, and the stepper drops that difference in a single step.
+static float newest_entry_speed(const plan_block_t *b) {
+    float v = fminf(b->max_entry_speed, b->nominal_speed);
+    return fminf(v, sqrtf(2.0f * b->acceleration * b->millimeters));
 }
 
 // Backward pass: from newest block toward planned pointer, clamp each
@@ -266,33 +291,27 @@ static void compute_trapezoid(plan_block_t *b) {
 static void planner_recalculate() {
     if (buffer_head == buffer_tail) return;
 
-    // The block the stepper is mid-way through must not be re-planned. Its
-    // ramp is already partly executed, so changing initial_rate or
-    // accelerate_until now would step the velocity discontinuously — audible
-    // as a click and visible as a mark on the paper. GRBL has the same rule.
-    // Note this is a snapshot: the ISR can finish the block right after we
-    // read it, which is harmless (we'd merely skip re-planning a block that
-    // no longer needs it, and the next enqueue re-runs this anyway).
-    const plan_block_t *executing = stepper_active_block();
-
+    // The block the stepper is mid-way through must not have its entry
+    // re-planned: its ramp is already partly executed, so changing
+    // initial_rate now would step the velocity discontinuously — audible as a
+    // click and visible as a mark on the paper. GRBL has the same rule. Its
+    // exit can still change until it starts decelerating (compute_trapezoid).
     uint8_t last = prev_index(buffer_head);   // newest block
     if (last == buffer_tail) {
-        // Only one block in buffer. Entry = max_entry, exit = 0.
         plan_block_t *b = &block_buffer[last];
-        if (b == executing) return;
-        b->entry_speed = fminf(b->max_entry_speed, b->nominal_speed);
+        noInterrupts();
+        bool executing = stepper_is_executing(b, nullptr);
+        interrupts();
+        if (executing) return;
+        b->entry_speed = newest_entry_speed(b);
         compute_trapezoid(b);
         buffer_planned = last;
         return;
     }
 
-    // Reverse pass. The newest block always plans to decelerate to zero,
-    // so its entry starts at min(max_entry, nominal).
+    // Reverse pass. The newest block always plans to decelerate to zero.
     uint8_t idx = last;
-    block_buffer[last].entry_speed =
-        fminf(block_buffer[last].max_entry_speed,
-              block_buffer[last].nominal_speed);
-    // The last block will decelerate from min(max_entry, nominal) down to 0.
+    block_buffer[last].entry_speed = newest_entry_speed(&block_buffer[last]);
 
     while (idx != buffer_planned) {
         uint8_t pidx = prev_index(idx);
@@ -302,7 +321,10 @@ static void planner_recalculate() {
         plan_block_t *prev = &block_buffer[pidx];
 
         // Reached the in-flight block: its entry speed is history now.
-        if (prev == executing) break;
+        noInterrupts();
+        bool executing = stepper_is_executing(prev, nullptr);
+        interrupts();
+        if (executing) break;
 
         // Max entry into prev such that it can decelerate to cur->entry over prev->length.
         float v_reach_sq = cur->entry_speed * cur->entry_speed
@@ -332,9 +354,9 @@ static void planner_recalculate() {
     while (idx != buffer_head) {
         uint8_t nidx = next_index(idx);
         plan_block_t *cur = &block_buffer[idx];
+        plan_block_t *nxt = (nidx != buffer_head) ? &block_buffer[nidx] : nullptr;
 
-        if (nidx != buffer_head) {
-            plan_block_t *nxt = &block_buffer[nidx];
+        if (nxt) {
             float v_reach_sq = cur->entry_speed * cur->entry_speed
                                + 2.0f * cur->acceleration * cur->millimeters;
             float v_max = sqrtf(v_reach_sq);
@@ -343,10 +365,13 @@ static void planner_recalculate() {
             }
         }
 
-        // Still clamp the *next* block above (the executing block really does
-        // limit what its successor can enter at), but never rewrite the
-        // trapezoid of the block being stepped.
-        if (cur != executing) compute_trapezoid(cur);
+        if (!compute_trapezoid(cur) && nxt) {
+            // cur is already decelerating to its old exit speed, which the
+            // next block has to accept as its entry.
+            float v_exit = (float)cur->final_rate * cur->millimeters
+                           / (float)cur->step_event_count;
+            if (nxt->entry_speed > v_exit) nxt->entry_speed = v_exit;
+        }
         idx = nidx;
     }
 
@@ -424,8 +449,9 @@ bool plan_buffer_line(float x_target, float y_target,
     b->nominal_speed = clamp_speed_for_direction(desired_mm_s, b->unit_vec);
     b->acceleration  = clamp_accel_for_direction(b->unit_vec);
 
-    // Junction deviation with previous block.
-    if (prev_unit_valid) {
+    // Junction deviation with previous block. An empty buffer means the
+    // stepper has run dry and the machine is at rest, so start from zero.
+    if (prev_unit_valid && buffer_head != buffer_tail) {
         b->max_entry_speed = junction_speed(prev_unit_vec, b->unit_vec,
                                             b->acceleration);
     } else {
@@ -469,6 +495,7 @@ bool plan_sync_command(uint8_t cmd, int32_t arg) {
     b->initial_rate = b->nominal_rate = b->final_rate = 0;
     b->accel_st = 0;
     b->accelerate_until = b->decelerate_after = 0;
+    b->events_per_mm_q8 = 0;
     b->sync_cmd = cmd;
     b->sync_arg = arg;
     b->recalculate_flag = false;

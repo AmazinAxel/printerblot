@@ -2,7 +2,7 @@
 
 #include <Arduino.h>
 #include "config.h"
-#include "planner.h"   // plan_block_t, for stepper_active_block()
+#include "planner.h"   // plan_block_t, for stepper_is_executing()
 
 // Stepper motion executor. Drives STEP pins from the planner's Cartesian
 // velocity profile using variable-period hardware alarms and Bresenham for
@@ -16,12 +16,8 @@ void stepper_wake();
 
 bool stepper_is_idle();
 bool stepper_is_in_hold();
-
-// The block the ISR is currently stepping, or nullptr if none. The planner
-// uses this to leave the in-flight block alone: its velocity ramp is already
-// partly executed, so rewriting initial_rate/accelerate_until underneath the
-// ISR produces a discontinuity in the middle of a move.
-const plan_block_t *stepper_active_block();
+// Motors at rest: idle, or a feed hold that has finished decelerating.
+bool stepper_is_stopped();
 
 // Realtime motion controls
 void stepper_feed_hold();            // decel to zero, retain buffer
@@ -38,3 +34,10 @@ void stepper_get_machine_position_mm(float *x, float *y);
 // For status reports and flow control hints.
 uint32_t stepper_current_rate_events_per_sec();
 
+
+// True if the ISR is executing `b` right now (mid-block, including a hold).
+// Its velocity ramp is already partly executed, so the planner must not
+// change its entry speed — that would step the velocity discontinuously.
+// If events_done is non-null it receives the events already emitted.
+// Call with interrupts disabled for a consistent answer.
+bool stepper_is_executing(const plan_block_t *b, uint32_t *events_done);

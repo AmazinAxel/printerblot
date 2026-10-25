@@ -83,7 +83,7 @@
   <div class="innerCard">
     <h2>Machine control</h2>
     <span id="status"></span>
-    <progress id="prog" value="0" max="1" hidden></progress>
+    <progress id="prog" value="0" max="100" hidden></progress>
     <div id="controls" class="row" style="margin-top:.6rem"></div>
     <!-- Only shown while idle: quality applies to the next job, so changing
          it mid-print would be misleading. -->
@@ -127,19 +127,14 @@ const PDFJS = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.10.38";
     $("#status").textContent =
       (s.state === "idle")
         ? (s.error
-             ? `Stopped since a move fell outside the work area ` +
-               `Move to origin and try again!`
-             : (s.total ? `Ready (${s.total} lines)` : "Ready"))
-        : `${label} (${s.done}/${s.total} lines)`;
+             ? "Stopped on an error in the file (usually a move outside " +
+               "the work area). Move to origin and try again!"
+             : "Ready")
+        : label;
 
     const prog = $("#prog");
-    if (s.state !== "idle" && s.total) {
-      prog.hidden = false;
-      prog.max = s.total;
-      prog.value = s.done;
-    } else {
-      prog.hidden = true;
-    }
+    prog.hidden = s.state === "idle";
+    prog.value = s.progress;
 
     // Quality applies to the next job, so hide it entirely while one runs
     // rather than showing a control that can't do anything.

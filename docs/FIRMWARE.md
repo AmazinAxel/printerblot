@@ -82,7 +82,12 @@ to reintroduce by accident:
   counter directly.
 
 HTTP handlers run on core 0 but never touch the parser. `/print`, `/pause`,
-`/stop` just set a `volatile bool`; `job_service()` applies it on core 1.
+`/stop` and `/quality` just set a volatile flag; `job_service()` applies it
+on core 1. Stop decelerates (feed hold) before flushing the planner.
+
+In a job file, `M0`/`M1` pause the job (resumable from the web UI) rather
+than feed-holding, and any failed line other than an unsupported command
+aborts the job instead of being skipped.
 
 ## Supported G-code
 
@@ -119,6 +124,25 @@ hold, where it returns `error:60` instead of blocking forever.
 
 Printing a real job doesn't use this path at all: the file is uploaded over
 HTTP and `job.cpp` feeds it to the parser directly.
+
+When a line has to wait for a planner slot (e.g. a long arc),
+`protocol_wait_for_planner_slot()` keeps reading the port: `?`, `!` and `~`
+act immediately, other bytes are set aside for the line reader, and Ctrl-X
+abandons the blocked line (no `ok` for it) and resets. Every spin loop on the
+planner must go through it — it is also what services pen/dwell sync blocks,
+and a loop that skipped that deadlocked behind an `M3`.
+
+## Planner invariants
+
+- The newest block's entry speed is capped at `sqrt(2·a·L)`: it must be able
+  to stop within itself, since nothing is queued after it.
+- A block queued into an empty planner starts from rest — the machine has
+  stopped, whatever the junction with the previous move would allow.
+- The block the stepper is executing is never re-planned at its entry, and
+  once it is decelerating its trapezoid is frozen; the next block's entry is
+  clamped to that frozen exit instead. Either change would jump the step rate.
+- After a feed hold, `~` ramps up from rest under the accel limit until it
+  meets the planned profile.
 
 ## Motion architecture
 
@@ -298,21 +322,14 @@ If you need any of those, use stock GRBL-HAL on a board with the right I/O.
 
 Deliberate compromises, not bugs:
 
-- **Planner race with an in-flight block.** `planner_recalculate()` can modify
-  the trapezoid fields of the block the stepper ISR is currently stepping.
-  The field-write burst is bracketed by `noInterrupts()`/`interrupts()` so the
-  ISR can't see a half-updated mix, but the block can still change shape
-  underneath it. On a pen plotter the window is vanishingly small (blocks are
-  ms, recalculate is µs).
-- **Feed hold stops at block boundaries**, not mid-motion across blocks. If a
-  block completes during a feed hold we park in `ST_HELD` rather than
-  continuing the decel chain into the next block. Correct for pen plotting,
-  less elegant than GRBL's multi-block decel.
+- **Feed hold decelerates across blocks** (the rate is rescaled per block via
+  `events_per_mm_q8`), but parks at a sync block (pen, dwell) rather than
+  running it mid-hold. The planner already brings speed to zero there.
 - **Arc segments have a 0.5 mm floor** (`ARC_MIN_SEGMENT_MM`). A tight chord
   tolerance on a small arc would otherwise emit dozens of sub-mm segments
   that the planner can't build a ramp across. Well below what's visible.
-- **`G92` offsets persist and accumulate** — there's no `G92.1` to clear them.
-  Set a clean origin with `G92 X0 Y0` after positioning manually.
+- **`G92` offsets persist and accumulate** until `G92.1` clears them. Set a
+  clean origin with `G92 X0 Y0` after positioning manually.
 - **Soft reset (`0x18`) preserves motor position**, because on real hardware
   the motors are physically wherever they are. The planner is re-anchored to
   that position rather than to a phantom (0, 0).

@@ -18,6 +18,7 @@ Usage:
 """
 
 import argparse
+import collections
 import re
 import sys
 import time
@@ -84,13 +85,38 @@ def wait_idle(s, timeout=120.0):
     raise RuntimeError("Timed out waiting for Idle")
 
 
+RX_BUDGET = 127  # firmware RX_BUFFER_SIZE - 1
+
+
 def stream(s, lines):
+    """Character-counting stream, as blotd sends a print, so a tuned value is
+    tested under the same planner conditions it will run under."""
+    inflight = collections.deque()
+    used = 0
+
+    def ack():
+        nonlocal used
+        deadline = time.time() + 120.0
+        while time.time() < deadline:
+            r = s.readline().decode(errors="replace").strip()
+            if r == "ok" or r.startswith("error"):
+                line = inflight.popleft()
+                used -= len(line) + 1
+                if r != "ok":
+                    print(f"    ! [{line}] → {r}", file=sys.stderr)
+                return
+        raise RuntimeError("Timed out waiting for ok")
+
     for line in lines:
         line = line.strip()
         if not line: continue
-        r = send_line(s, line)
-        if r.startswith("error"):
-            print(f"    ! [{line}] → {r}", file=sys.stderr)
+        while inflight and used + len(line) + 1 > RX_BUDGET:
+            ack()
+        s.write((line + "\n").encode())
+        inflight.append(line)
+        used += len(line) + 1
+    while inflight:
+        ack()
 
 
 def parse_all_settings(s):
@@ -166,8 +192,8 @@ def run_tuning(s, name, setting, pattern_fn, start, growth,
             print(f"  ! could not set {setting}, aborting test")
             break
 
-        stream(s, test_block(pattern_fn(value)))
         try:
+            stream(s, test_block(pattern_fn(value)))
             wait_idle(s)
         except RuntimeError as e:
             print(f"  ! {e}")

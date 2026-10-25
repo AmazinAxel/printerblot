@@ -40,6 +40,7 @@ Origin `(0, 0)` is the bottom-left corner of the work area. `+X` is right, `+Y` 
 | `G90` | Absolute positioning *(default)*                                |
 | `G91` | Relative positioning                                            |
 | `G92` | `X Y` — set current position as new work origin (offset)        |
+| `G92.1` | Clear the `G92` offset (work coords = machine coords)         |
 | `G28` | Rapid to stored origin (the last `G92` point, or 0,0 at boot)   |
 
 ---
@@ -217,7 +218,8 @@ GRBL-compatible subset. Returned as `error:<N>\r\n`.
 - `G38.x` (probing)
 - `G43` (tool length offset), `G53` (machine coord), `G54`-`G59` (WCS)
 - `G80`-`G89` (canned cycles)
-- `G92.1` (clear G92 offset)
+- Any other decimal G/M code (`G38.2`, `G92.2`, ...) — refused rather than
+  rounded to a different command
 - `$H` (homing — no switches on Blot)
 - `$C` (check mode), `$SLP` (sleep)
 - `$N0`/`$N1` (startup blocks)

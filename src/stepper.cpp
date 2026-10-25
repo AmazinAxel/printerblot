@@ -37,6 +37,12 @@ static volatile uint32_t current_rate = 0;
 static uint32_t hold_events_at_start;
 static uint32_t hold_start_rate;  // integer: read from the ISR, no FPU
 
+// After a hold the motors are at rest, but the planned profile may want
+// cruise speed at this point of the block (or a nonzero junction speed at
+// the next one). Until the profile drops below it, the rate is capped by an
+// accel ramp from zero: v² grows by 2·a per step event, across blocks.
+static volatile bool resuming = false;
+
 static inline void IRAM_ATTR schedule_next_isr(uint32_t delay_us) {
     if (delay_us < MIN_STEP_INTERVAL_US) delay_us = MIN_STEP_INTERVAL_US;
     steptimer_arm(delay_us);
@@ -91,6 +97,7 @@ void stepper_reset() {
     digitalWrite(PIN_MOTOR2_STEP, LOW);
     state = ST_IDLE;
     cur = nullptr;
+    resuming = false;
     events_done = 0;
     counter_m1 = counter_m2 = 0;
     current_rate = 0;
@@ -98,14 +105,7 @@ void stepper_reset() {
 
 bool stepper_is_idle()    { return state == ST_IDLE; }
 bool stepper_is_in_hold() { return state == ST_FEED_HOLD || state == ST_HELD; }
-
-// Only report a block while it's actually being stepped. In ST_WAIT_SYNC the
-// block is a zero-length sync marker the main loop owns, and in ST_IDLE `cur`
-// is already nullptr — neither needs protecting from the planner.
-const plan_block_t *stepper_active_block() {
-    if (state != ST_RUNNING && state != ST_FEED_HOLD) return nullptr;
-    return cur;
-}
+bool stepper_is_stopped() { return state == ST_IDLE || state == ST_HELD; }
 
 void stepper_wake() {
     if (state == ST_IDLE) {
@@ -123,6 +123,7 @@ void stepper_feed_hold() {
 
 void stepper_cycle_start() {
     if (state == ST_HELD) {
+        resuming = true;
         state = cur ? ST_RUNNING : ST_IDLE;
         schedule_next_isr(10);
     }
@@ -130,6 +131,16 @@ void stepper_cycle_start() {
 
 uint32_t stepper_current_rate_events_per_sec() {
     return current_rate;
+}
+
+// In ST_WAIT_SYNC the block is a zero-length sync marker the main loop owns,
+// and in ST_IDLE `cur` is already nullptr — neither needs protecting. ST_HELD
+// does: a hold that ran out mid-block parks with `cur` partly executed.
+bool stepper_is_executing(const plan_block_t *b, uint32_t *events) {
+    if (b == nullptr || cur != b || state == ST_IDLE || state == ST_WAIT_SYNC)
+        return false;
+    if (events) *events = events_done;
+    return true;
 }
 
 
@@ -279,22 +290,33 @@ static void IRAM_ATTR stepper_isr_body() {
 
     // Block done?
     if (events_done >= cur->step_event_count) {
-        // If we're in feed hold when a block completes, don't load the next
-        // one — park in ST_HELD. Otherwise we'd lose the hold state and the
-        // next block would start at full nominal rate. Letting the decel chain
-        // span blocks would be nicer but adds complexity; for a pen plotter
-        // an abrupt stop at a block boundary is acceptable.
+        // A feed hold that hasn't finished decelerating carries on into the
+        // next motion block, so the stop is a continuous ramp rather than an
+        // abrupt halt at the block boundary. The rate is in step events/s,
+        // whose scale differs per block, so convert it at the same tip speed.
+        // A sync block (pen, dwell) or an empty planner ends the hold here:
+        // the planner already brought the speed to zero for those.
         if (state == ST_FEED_HOLD) {
+            uint32_t prev_epm = cur->events_per_mm_q8;
             cur = nullptr;
             plan_discard_current_block();
-            state = ST_HELD;
-            current_rate = 0;
-            return;
+            plan_block_t *next = plan_get_current_block();
+            if (next == nullptr || next->sync_cmd != SYNC_NONE ||
+                prev_epm == 0 || next->events_per_mm_q8 == 0) {
+                state = ST_HELD;
+                current_rate = 0;
+                return;
+            }
+            load_next_block();                 // sets ST_RUNNING
+            hold_start_rate = current_rate * next->events_per_mm_q8 / prev_epm;
+            hold_events_at_start = 0;
+            state = ST_FEED_HOLD;
+        } else {
+            cur = nullptr;
+            plan_discard_current_block();
+            load_next_block();
+            if (state == ST_IDLE || state == ST_WAIT_SYNC) return;
         }
-        cur = nullptr;
-        plan_discard_current_block();
-        load_next_block();
-        if (state == ST_IDLE || state == ST_WAIT_SYNC) return;
         // Need to compute first-step interval of the new block.
     }
 
@@ -315,6 +337,13 @@ static void IRAM_ATTR stepper_isr_body() {
         rate = isqrt(v0sq - drop);
     } else {
         rate = compute_rate(events_done);
+        if (resuming) {
+            // Integer, for the same FPU reason as compute_rate().
+            uint32_t cap = isqrt((uint64_t)current_rate * current_rate
+                                 + 2ULL * cur->accel_st);
+            if (rate > cap) rate = cap;
+            else resuming = false;  // profile is below the ramp: caught up
+        }
     }
 
     if (rate == 0) {

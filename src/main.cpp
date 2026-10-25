@@ -54,8 +54,9 @@ void loop() {
   // When there's nothing to do, hand the core back to FreeRTOS so it can
   // enter its idle state instead of spinning at 240MHz. Strictly gated on
   // being idle: job_service() keeps the planner topped up during a print and
-  // any delay here would eat into that.
-  if (job_state() == JOB_IDLE && stepper_is_idle()) {
+  // any delay here would eat into that. A paused job feeds nothing, so it
+  // counts as idle too — a pause can last hours.
+  if (job_state() != JOB_RUNNING && stepper_is_idle()) {
     delay(2);
   }
 

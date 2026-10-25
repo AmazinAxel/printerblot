@@ -9,7 +9,6 @@
 
 #include "config.h"
 #include "job.h"
-#include "stepper.h"
 
 // Hard error rather than a warning: without credentials the board has no
 // network at all, which looks like a WiFi bug later.
@@ -17,6 +16,13 @@
   #error "src/wifi_config.h missing. Run: cp src/wifi_config.h.example src/wifi_config.h"
 #endif
 #include "wifi_config.h"
+
+// Radio transmit power. The default is the 19.5dBm maximum, but a plotter
+// sits near its router and the PA is the biggest heat source on the board
+// while transmitting. Override in wifi_config.h if the link is marginal.
+#ifndef WIFI_TX_POWER
+#define WIFI_TX_POWER WIFI_POWER_11dBm
+#endif
 
 static AsyncWebServer server(80);
 static AsyncEventSource events("/events");
@@ -43,23 +49,18 @@ static const char *state_name() {
 // ten reallocating appends plus two temporary Strings for the floats. The
 // output is bounded and small, so a stack buffer is both faster and takes no
 // heap — which matters because the parser is allocating on the same core.
+// Only what the page renders: no position or float formatting.
 static void state_json(char *out, size_t cap) {
-    float x = 0, y = 0;
-    stepper_get_machine_position_mm(&x, &y);
     snprintf(out, cap,
-             "{\"state\":\"%s\",\"quality\":\"%s\","
-             "\"error\":%s,\"done\":%lu,\"total\":%lu,\"x\":%.2f,\"y\":%.2f}",
+             "{\"state\":\"%s\",\"quality\":\"%s\",\"error\":%s,\"progress\":%u}",
              state_name(),
              job_quality(),
-             job_had_error()     ? "true" : "false",
-             (unsigned long)job_lines_done(),
-             (unsigned long)job_lines_total(),
-             x, y);
+             job_had_error() ? "true" : "false",
+             (unsigned)job_progress());
 }
 
-// Longest realistic payload is ~150 bytes; 192 leaves headroom for the two
-// float fields at their widest without risking truncation.
-#define STATE_JSON_CAP 192
+// Longest payload is ~75 bytes.
+#define STATE_JSON_CAP 96
 
 // Pushed to every connected browser on each state change, so a UI that
 // didn't cause the change still sees it.
@@ -157,6 +158,7 @@ static void start_wifi() {
     // parking its receiver between beacons saves ~60-80mA and a matching
     // amount of self-heating.
     WiFi.setSleep(true);
+    WiFi.setTxPower(WIFI_TX_POWER);
     WiFi.setAutoReconnect(true);
     WiFi.begin(WIFI_SSID, WIFI_PASS);
     // Connection is finished in wifi_service(); see note above.
@@ -203,11 +205,8 @@ void webui_init() {
 
     server.on("/quality", HTTP_POST, [](AsyncWebServerRequest *req) {
         if (!req->hasParam("q", true)) { send_ok(req, false); return; }
-        String q = req->getParam("q", true)->value();
-        if (q != "draft" && q != "poster") { send_ok(req, false); return; }
-        job_set_quality(q.c_str());
-        send_ok(req, true);
-        broadcast_state();
+        // Applied on loop()'s core, which broadcasts the new state itself.
+        send_ok(req, job_set_quality(req->getParam("q", true)->value().c_str()));
     });
 
     // Gcode upload. The browser has already done the PDF conversion, so this
@@ -223,9 +222,6 @@ void webui_init() {
             if (!ok) {
                 if (upload_file) upload_file.close();
                 LittleFS.remove(JOB_PATH);
-                job_notify_new_file();   // clears the stale line count
-            } else {
-                job_notify_new_file();
             }
             upload_failed = false;
             req->send(200, "application/json",
@@ -263,8 +259,8 @@ void webui_init() {
 
 // WiFi modem-sleep parks the receiver between AP beacons. That saves a lot of
 // idle power, but it also adds tens of ms of latency — which matters during a
-// print, because job_service() feeds one gcode line per loop() and the planner
-// only buffers 16 blocks. Drain that and the plot stutters. So: radio fully
+// print, because the planner only buffers 16 blocks and a stalled loop()
+// can't refill it. Drain that and the plot stutters. So: radio fully
 // awake while printing, asleep the rest of the time.
 static void service_wifi_power(bool printing) {
     static bool awake = false;
@@ -276,5 +272,6 @@ static void service_wifi_power(bool printing) {
 void webui_service() {
     wifi_service();
     mdns_publish_global_ipv6();
-    service_wifi_power(job_state() != JOB_IDLE);
+    // A paused job isn't feeding, so the radio can sleep through the pause.
+    service_wifi_power(job_state() == JOB_RUNNING);
 }

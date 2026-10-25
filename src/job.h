@@ -38,16 +38,13 @@ void job_resume();
 void job_stop();    // abort, lift pen, return to job origin
 
 JobState job_state();
-uint32_t job_lines_done();
-uint32_t job_lines_total();
+uint8_t  job_progress();   // 0-100: share of the file fed to the parser
 
 // True if the last job stopped on an error (e.g. a move outside the work
 // envelope) rather than running to completion. Cleared when a job starts.
 bool job_had_error();
 
-// Print quality preset ("draft" or "poster"), persisted in settings.
-void job_set_quality(const char *q);
+// Print quality preset ("draft" or "poster"), persisted in settings. Safe
+// from the HTTP task like the controls above; false if unknown or not idle.
+bool job_set_quality(const char *q);
 const char *job_quality();
-
-// Called by the upload handler once a new gcode file has landed.
-void job_notify_new_file();

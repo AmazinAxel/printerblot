@@ -1,6 +1,7 @@
 #include "arc.h"
 #include "planner.h"
 #include "stepper.h"
+#include "protocol.h"
 #include "config.h"
 #include <Arduino.h>  // for yield() — services USB during tight loops
 
@@ -119,26 +120,15 @@ bool arc_interpolate(float target_x, float target_y,
         float px = cx + rx;
         float py = cy + ry;
 
-        // Same feed-hold bail-out as gcode.cpp's wait_for_slot(): a held
-        // stepper never drains the buffer, so spinning here would hang the
-        // parser until the watchdog fires. Abandoning the arc part-way leaves
-        // the pen mid-curve, but the alternative is a reboot mid-print.
-        while (plan_buffer_available() == 0) {
-            if (stepper_is_in_hold()) return false;
-            stepper_wake();
-            stepper_service_sync();
-            yield();
-        }
+        // Gives up in feed hold (see protocol.h): abandoning the arc part-way
+        // leaves the pen mid-curve, but the alternative is a reboot mid-print.
+        // A reset abandons it too, silently.
+        if (!protocol_wait_for_planner_slot()) return protocol_reset_pending();
         plan_buffer_line(px, py, feedrate_mm_min, false);
     }
     // Final point — use the exact commanded target (not the accumulated
     // rotation) to avoid drift.
-    while (plan_buffer_available() == 0) {
-        if (stepper_is_in_hold()) return false;
-        stepper_wake();
-        stepper_service_sync();
-        yield();
-    }
+    if (!protocol_wait_for_planner_slot()) return protocol_reset_pending();
     plan_buffer_line(target_x, target_y, feedrate_mm_min, false);
     return true;
 }

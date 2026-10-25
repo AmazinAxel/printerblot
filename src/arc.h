@@ -17,7 +17,9 @@
 // outside the soft-limit envelope — the bounds test runs before the first
 // segment is queued, so a rejected arc draws nothing at all. When it returns
 // false, `*out_of_bounds` (if given) distinguishes the two cases so the
-// caller can report the right error.
+// caller can report the right error. A feed hold while waiting for the
+// planner also abandons the arc and returns false; a soft reset abandons it
+// and returns true.
 
 bool arc_interpolate(float target_x, float target_y,
                      float offset_i, float offset_j,

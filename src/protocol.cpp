@@ -54,16 +54,80 @@ void protocol_init() {
     line_len = 0;
 }
 
+// Bytes read off the serial port while a line was blocked waiting for the
+// planner (protocol_wait_for_planner_slot) — everything but the realtime
+// commands, which were acted on immediately. Drained before the port itself so
+// the stream stays in order. tune.py keeps at most 127 bytes in flight, so
+// this only overflows on a misbehaving sender; then the port is simply left
+// unread until there is room.
+static uint8_t  pending[256];
+static uint16_t pending_head = 0, pending_len = 0;
+static bool     reset_pending = false;
+
+static int next_byte() {
+    if (pending_len > 0) {
+        uint8_t c = pending[pending_head];
+        pending_head = (uint16_t)((pending_head + 1) % sizeof(pending));
+        pending_len--;
+        return c;
+    }
+    return Serial.available() ? Serial.read() : -1;
+}
+
+static void soft_reset() {
+    stepper_reset();
+    plan_reset();
+    gcode_reset();
+    sync_planner_to_machine();
+    line_len = 0;
+    line_overflow = false;
+    reset_pending = false;
+}
+
+bool protocol_reset_pending() { return reset_pending; }
+
+bool protocol_wait_for_planner_slot() {
+    while (plan_buffer_available() == 0) {
+        while (!reset_pending && pending_len < sizeof(pending) && Serial.available()) {
+            int c = Serial.read();
+            if (c < 0) break;
+            switch (c) {
+                case RT_STATUS_REPORT: emit_status_report();   break;
+                case RT_FEED_HOLD:     stepper_feed_hold();    break;
+                case RT_CYCLE_START:   stepper_cycle_start();  break;
+                case RT_SOFT_RESET:
+                    // Everything before the reset is void; anything after it
+                    // stays in the port for protocol_service to read.
+                    reset_pending = true;
+                    pending_len = 0;
+                    break;
+                default:
+                    pending[(pending_head + pending_len) % sizeof(pending)] = (uint8_t)c;
+                    pending_len++;
+            }
+        }
+        if (reset_pending) return false;
+        // A held stepper never drains the buffer, and a wait that outlasts the
+        // hold would starve job_service() (so the web UI's stop never lands)
+        // until the 30s watchdog reboots mid-print. Give up instead.
+        if (stepper_is_in_hold()) return false;
+        stepper_wake();
+        stepper_service_sync();
+        yield();  // service USB so the host doesn't reset us
+    }
+    return true;
+}
+
 void protocol_service() {
     // Let the stepper main-loop side handle any queued sync command.
     stepper_service_sync();
     // Lazy-flush any pending setting changes (only when idle & debounced).
     settings_service_save();
+    // A reset can also land while a job line (not a serial one) was blocked.
+    if (reset_pending) soft_reset();
 
-    while (Serial.available()) {
-        int c = Serial.read();
-        if (c < 0) break;
-
+    int c;
+    while ((c = next_byte()) >= 0) {
         // Realtime commands — intercept before the line buffer.
         switch (c) {
             case RT_STATUS_REPORT:
@@ -76,12 +140,7 @@ void protocol_service() {
                 stepper_cycle_start();
                 continue;
             case RT_SOFT_RESET:
-                stepper_reset();
-                plan_reset();
-                gcode_reset();
-                sync_planner_to_machine();
-                line_len = 0;
-                line_overflow = false;
+                soft_reset();
                 continue;
         }
 
@@ -96,6 +155,9 @@ void protocol_service() {
             line_buf[line_len] = '\0';
             StatusCode s = gcode_execute_line(line_buf);
             line_len = 0;
+            // A reset that arrived while the line was blocked aborted it:
+            // no ok/error for it, just the reset.
+            if (reset_pending) { soft_reset(); continue; }
             if (s == STATUS_OK) emit_ok();
             else emit_error((uint8_t)s);
             continue;

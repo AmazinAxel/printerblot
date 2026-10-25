@@ -91,12 +91,8 @@ bench-tested migration. Pin an exact release tag, not `stable`.
 
 ## Known-unfixed
 
-- **Planner/ISR race:** `planner_recalculate()` can reshape the block the ISR
-  is currently stepping. Field writes are bracketed by `noInterrupts()`, so no
-  half-updated read, but the block can still change under it. Fix is a `busy`
-  flag on the tail block; needs hardware validation to confirm it isn't
-  already benign.
-- **Feed hold stops at block boundaries**, not across blocks.
+- **Feed hold decelerates across blocks but parks at sync blocks** (pen,
+  dwell). Job Stop uses it, so it decelerates before flushing the planner.
 - **Soft limits are enforced** (`$20`, default on) in `plan_buffer_line()` —
   the single choke point all motion routes through. Arcs are bounds-checked
   as a whole *before* any segment is queued, using the exact arc bounding box

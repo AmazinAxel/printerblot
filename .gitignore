@@ -1,5 +1,6 @@
 # Test build artifacts
 *.o
+*.d
 run_tests
 
 # platformio
