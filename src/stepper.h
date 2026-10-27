@@ -6,34 +6,35 @@
 
 // Stepper motion executor. Drives STEP pins from the planner's Cartesian
 // velocity profile using variable-period hardware alarms and Bresenham for
-// CoreXY motor mixing.
+// CoreXY motor mixing. Wakes the loop (wake.h) whenever a planner slot
+// frees, a pen block is reached, or motion stops.
 
 void stepper_init();
-void stepper_reset();                // flush on soft reset
+void stepper_reset();                // flush: drop the plan, keep position
 
-// Kick the ISR if idle. Call after queueing new blocks.
+// Start executing queued blocks if idle (restores the full CPU clock first).
+// Call after queueing.
 void stepper_wake();
+void stepper_power_save();           // drop to 80MHz if fully idle
 
 bool stepper_is_idle();
-bool stepper_is_in_hold();
-// Motors at rest: idle, or a feed hold that has finished decelerating.
+// Motors at rest: idle, held, or parked on a pen block.
 bool stepper_is_stopped();
 
-// Realtime motion controls
 void stepper_feed_hold();            // decel to zero, retain buffer
-void stepper_cycle_start();          // resume after hold
 
-// The main loop calls this every iteration; if the ISR is waiting on a
-// sync command (servo, dwell), the main loop handles it and wakes the ISR.
-void stepper_service_sync();
+// Loop side of pen blocks: moves the pen, then releases the block once it
+// has arrived. Call on every wake.
+void stepper_service();
+
+// A4988 enable, written directly: only ever changed while no motion is
+// queued (job start, idle release), so it can't race the planner.
+void stepper_set_drivers(bool on);
+bool stepper_drivers_on();
 
 // Machine position (motor steps). Updated by the ISR as it emits pulses.
 // Read from main loop only — treat as best-effort snapshot.
 void stepper_get_machine_position_mm(float *x, float *y);
-
-// For status reports and flow control hints.
-uint32_t stepper_current_rate_events_per_sec();
-
 
 // True if the ISR is executing `b` right now (mid-block, including a hold).
 // Its velocity ramp is already partly executed, so the planner must not

@@ -2,11 +2,8 @@
 
 #include <stdint.h>
 
-// Job runner: streams the stored gcode file into the gcode parser.
-//
-// The web server and the parser live on the same chip, so there's no serial
-// protocol in between — job_service() hands lines straight to
-// gcode_execute_line().
+// Job runner: streams the stored gcode file into the gcode parser. This is
+// the only way anything gets printed — there is no USB or serial input.
 
 // LittleFS path the upload handler writes and the runner reads.
 extern const char *JOB_PATH;
@@ -26,12 +23,13 @@ void job_init();
 // finishing on its own is never reflected.
 void job_set_on_change(void (*cb)());
 
-// Called from loop(). Tops the planner up to within PLANNER_HEADROOM slots
-// of full, so lookahead always has blocks to plan a corner against.
+// Called from loop() on every wake. Applies web requests, keeps the planner
+// topped up (so lookahead always has blocks to plan a corner against),
+// finishes jobs, and releases the motors once idle.
 void job_service();
 
 // Controls. Safe to call from the HTTP task on the other core: these only
-// set a flag, which job_service() applies on the core that owns the parser.
+// set a flag and wake the loop, which applies it on the parser's core.
 bool job_start();
 void job_pause();   // pause at the next line boundary, lifting the pen
 void job_resume();

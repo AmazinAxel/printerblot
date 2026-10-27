@@ -2,6 +2,7 @@
 #include "planner.h"
 #include "kinematics.h"
 #include "steptimer.h"
+#include "wake.h"
 
 // IRAM_ATTR comes from config.h (via stepper.h).
 // The pen servo is behind penservo.h because on ESP32-S3 it can't use PWM at
@@ -11,9 +12,9 @@
 enum StepperState : uint8_t {
     ST_IDLE,
     ST_RUNNING,
-    ST_WAIT_SYNC,     // blocked on a sync command; main loop services it
-    ST_FEED_HOLD,     // decelerating to zero from realtime `!`
-    ST_HELD,          // stopped, buffer retained
+    ST_WAIT_SYNC,     // parked on a pen block; the loop services it
+    ST_FEED_HOLD,     // decelerating to zero (job stop)
+    ST_HELD,          // stopped by the hold, buffer retained
 };
 
 static volatile StepperState state = ST_IDLE;
@@ -24,37 +25,29 @@ static int32_t  counter_m1;       // Bresenham accumulator, motor 1
 static int32_t  counter_m2;       // Bresenham accumulator, motor 2
 static uint32_t events_done;      // step events completed in current block
 
-// Accumulated motor position (in steps, signed). Used for status reports;
-// converted to Cartesian in stepper_get_machine_position_mm.
+// Accumulated motor position (in steps, signed), converted to Cartesian in
+// stepper_get_machine_position_mm.
 static volatile int32_t motor_pos_steps[2] = {0, 0};
 
-// Current step-event rate (events/s), exposed for status report.
-static volatile uint32_t current_rate = 0;
-
+// Current step-event rate (events/s): where a feed hold decelerates from.
+static uint32_t current_rate = 0;
 
 // For decel-to-stop in feed-hold: we keep decelerating the current block
 // until rate reaches zero, then park in ST_HELD.
 static uint32_t hold_events_at_start;
 static uint32_t hold_start_rate;  // integer: read from the ISR, no FPU
 
-// After a hold the motors are at rest, but the planned profile may want
-// cruise speed at this point of the block (or a nonzero junction speed at
-// the next one). Until the profile drops below it, the rate is capped by an
-// accel ramp from zero: v² grows by 2·a per step event, across blocks.
-static volatile bool resuming = false;
+// Set once the loop has sent the pen of the parked sync block on its way.
+static bool sync_started = false;
+
+static bool drivers_on = false;
 
 static inline void IRAM_ATTR schedule_next_isr(uint32_t delay_us) {
     if (delay_us < MIN_STEP_INTERVAL_US) delay_us = MIN_STEP_INTERVAL_US;
     steptimer_arm(delay_us);
 }
 
-static void IRAM_ATTR stepper_isr_body();
-
-// Fired by the step timer. The platform layer has already acknowledged the
-// interrupt by the time we get here.
-static void IRAM_ATTR stepper_alarm_handler() {
-    stepper_isr_body();
-}
+static bool IRAM_ATTR stepper_isr();
 
 void stepper_init() {
     // Disable the drivers BEFORE making the pin an output. pinMode(OUTPUT)
@@ -82,33 +75,61 @@ void stepper_init() {
     // passed into init so the very first pulse is already the right one.
     penservo_init(PIN_SERVO, DEFAULT_PEN_UP_US);
 
-    steptimer_init(stepper_alarm_handler);
+    steptimer_init(stepper_isr);
 
     state = ST_IDLE;
 }
 
 void stepper_reset() {
-    // Soft reset: clear execution state but DO NOT zero motor_pos_steps —
-    // on real hardware the motors are physically wherever they are; resetting
-    // the counter would cause the next motion plan to be wrong.
+    // Clear execution state but DO NOT zero motor_pos_steps: the motors are
+    // physically wherever they are, and the next plan starts from there.
     // Disarm first so the ISR can't fire midway through clearing state.
     steptimer_cancel();
     digitalWrite(PIN_MOTOR1_STEP, LOW);
     digitalWrite(PIN_MOTOR2_STEP, LOW);
     state = ST_IDLE;
     cur = nullptr;
-    resuming = false;
+    sync_started = false;
     events_done = 0;
     counter_m1 = counter_m2 = 0;
     current_rate = 0;
 }
 
 bool stepper_is_idle()    { return state == ST_IDLE; }
-bool stepper_is_in_hold() { return state == ST_FEED_HOLD || state == ST_HELD; }
-bool stepper_is_stopped() { return state == ST_IDLE || state == ST_HELD; }
+// A parked sync block counts: the motors are at rest while the pen moves.
+bool stepper_is_stopped() {
+    return state == ST_IDLE || state == ST_HELD || state == ST_WAIT_SYNC;
+}
+
+void stepper_set_drivers(bool on) {
+    digitalWrite(PIN_DRIVER_EN, on ? LOW : HIGH);  // A4988: LOW = enabled
+    drivers_on = on;
+}
+
+bool stepper_drivers_on() { return drivers_on; }
+
+// CPU clock: 80MHz (the floor WiFi allows) while idle, 240MHz for motion.
+// The step ISR's pulse timing and cycle budget assume F_CPU, so the only
+// path that starts the step timer from rest, stepper_wake(), goes through
+// cpu_full_speed() first. APB stays 80MHz either way, so the step/servo
+// timers are unaffected by the switch.
+static bool cpu_slow = false;
+
+static void cpu_full_speed() {
+    if (!cpu_slow) return;
+    setCpuFrequencyMhz(F_CPU / 1000000);
+    cpu_slow = false;
+}
+
+void stepper_power_save() {
+    if (cpu_slow || state != ST_IDLE || !plan_is_empty()) return;
+    setCpuFrequencyMhz(80);
+    cpu_slow = true;
+}
 
 void stepper_wake() {
-    if (state == ST_IDLE) {
+    if (state == ST_IDLE && !plan_is_empty()) {
+        cpu_full_speed();
         schedule_next_isr(10);
     }
 }
@@ -121,18 +142,6 @@ void stepper_feed_hold() {
     }
 }
 
-void stepper_cycle_start() {
-    if (state == ST_HELD) {
-        resuming = true;
-        state = cur ? ST_RUNNING : ST_IDLE;
-        schedule_next_isr(10);
-    }
-}
-
-uint32_t stepper_current_rate_events_per_sec() {
-    return current_rate;
-}
-
 // In ST_WAIT_SYNC the block is a zero-length sync marker the main loop owns,
 // and in ST_IDLE `cur` is already nullptr — neither needs protecting. ST_HELD
 // does: a hold that ran out mid-block parks with `cur` partly executed.
@@ -143,7 +152,6 @@ bool stepper_is_executing(const plan_block_t *b, uint32_t *events) {
     return true;
 }
 
-
 void stepper_get_machine_position_mm(float *x, float *y) {
     // Convert motor steps back to Cartesian. Snapshot volatile reads.
     int32_t m1 = motor_pos_steps[0];
@@ -153,33 +161,30 @@ void stepper_get_machine_position_mm(float *x, float *y) {
     motor_to_cartesian(a, b, x, y);
 }
 
-// ─────── Sync-command servicing (main loop side) ───────
-
-void stepper_service_sync() {
+// ─────── Sync blocks (main loop side) ───────
+//
+// The ISR wakes the loop when it parks on a pen block. The first pass sends
+// the pen on its way; if it has to travel, the servo ISR wakes the loop
+// again once it has arrived, and that pass releases the block. No ISR is
+// armed while parked, so nothing races with this.
+void stepper_service() {
     if (state != ST_WAIT_SYNC || cur == nullptr) return;
 
-    switch (cur->sync_cmd) {
-        case SYNC_SERVO:
-            // Standard position servo: just set the target angle and hold.
-            penservo_write_us((uint16_t)cur->sync_arg);
-            delay(DEFAULT_PEN_MOVE_MS);
-            break;
-        case SYNC_DWELL:
-            if (cur->sync_arg > 0) delay((unsigned long)cur->sync_arg);
-            break;
-        case SYNC_SET_ENABLE:
-            isr_pin_write(PIN_DRIVER_EN, !cur->sync_arg);
-            break;
+    if (!sync_started) {
+        sync_started = true;
+        if (penservo_move((uint16_t)cur->sync_arg)) return;  // travelling
+    } else if (!penservo_arrived()) {
+        return;
     }
 
-    // Consume the sync block and resume.
+    sync_started = false;
     cur = nullptr;
     plan_discard_current_block();
     state = ST_IDLE;
     stepper_wake();
 }
 
-// ─────── ISR body ───────
+// ─────── ISR ───────
 
 static void IRAM_ATTR load_next_block() {
     cur = plan_get_current_block();
@@ -212,7 +217,24 @@ static void IRAM_ATTR load_next_block() {
 // Every caller here immediately truncates to an integer step rate, so an
 // integer sqrt is exact for our purposes and pulls in no libm at all. Binary
 // digit-by-digit method: fully branch-predictable, no FPU, no flash access.
+//
+// Real inputs are v² ≤ ~1e9, so the 32-bit path (half the iterations, and
+// native-width ops on this 32-bit core) is the one that runs; it matches the
+// 64-bit one exactly over the whole uint32 range.
 static inline uint32_t IRAM_ATTR isqrt(uint64_t n) {
+    if (n <= 0xFFFFFFFFu) {
+        uint32_t m = (uint32_t)n, rem = 0, root = 0;
+        for (int i = 0; i < 16; i++) {
+            root <<= 1;
+            rem = (rem << 2) | (m >> 30);
+            m <<= 2;
+            if (root < rem) {
+                rem -= root | 1;
+                root += 2;
+            }
+        }
+        return root >> 1;
+    }
     uint64_t rem = 0, root = 0;
     for (int i = 0; i < 32; i++) {
         root <<= 1;
@@ -249,15 +271,25 @@ static inline uint32_t IRAM_ATTR compute_rate(uint32_t k) {
     }
 }
 
-// Called from the timer alarm IRQ.
-static void IRAM_ATTR stepper_isr_body() {
-    if (state == ST_HELD) return;  // ignore stale fires
+// Finish a step pulse started at cycle count `start`: wait out whatever is
+// left of the A4988's minimum high time (1µs; we hold 2µs for margin), then
+// drop both STEP lines. Idempotent, so every exit path can call it.
+static inline void IRAM_ATTR end_step_pulse(uint32_t start) {
+    isr_delay_us_since(start, STEP_PULSE_US);
+    isr_pin_write(PIN_MOTOR1_STEP, false);
+    isr_pin_write(PIN_MOTOR2_STEP, false);
+}
 
-    if (state == ST_WAIT_SYNC) return;  // main loop will wake us
+// Called from the timer alarm IRQ. Returns true if it woke the loop task
+// (a planner slot freed, a pen block reached, or motion stopped).
+static bool IRAM_ATTR stepper_isr() {
+    // Parked states are only left by the loop, which re-arms the timer.
+    if (state == ST_HELD || state == ST_WAIT_SYNC) return false;
 
     if (cur == nullptr) {
         load_next_block();
-        if (state == ST_IDLE || state == ST_WAIT_SYNC) return;
+        if (state == ST_WAIT_SYNC) return wake_loop_from_isr();
+        if (state == ST_IDLE) return false;
         // ST_RUNNING with fresh block: fall through to emit first step event
     }
 
@@ -278,24 +310,28 @@ static void IRAM_ATTR stepper_isr_body() {
 
     if (pulse_m1) isr_pin_write(PIN_MOTOR1_STEP, true);
     if (pulse_m2) isr_pin_write(PIN_MOTOR2_STEP, true);
-    // A4988 min pulse width = 1µs; hold 2µs for margin.
-    isr_delay_us(STEP_PULSE_US);
-    if (pulse_m1) isr_pin_write(PIN_MOTOR1_STEP, false);
-    if (pulse_m2) isr_pin_write(PIN_MOTOR2_STEP, false);
+    // The pins come down in end_step_pulse(): the bookkeeping and rate math
+    // below run during the pulse instead of a dead busy-wait.
+    uint32_t pulse_start = XTHAL_GET_CCOUNT();
 
     if (pulse_m1) motor_pos_steps[0] += (cur->direction_bits & 0x01) ? -1 : 1;
     if (pulse_m2) motor_pos_steps[1] += (cur->direction_bits & 0x02) ? -1 : 1;
 
     events_done++;
+    bool woke = false;
 
     // Block done?
     if (events_done >= cur->step_event_count) {
+        // Before the next block can change DIR under a still-high STEP.
+        end_step_pulse(pulse_start);
+        // A planner slot is free: the job feeder can queue another line.
+        woke = wake_loop_from_isr();
         // A feed hold that hasn't finished decelerating carries on into the
         // next motion block, so the stop is a continuous ramp rather than an
         // abrupt halt at the block boundary. The rate is in step events/s,
         // whose scale differs per block, so convert it at the same tip speed.
-        // A sync block (pen, dwell) or an empty planner ends the hold here:
-        // the planner already brought the speed to zero for those.
+        // A pen block or an empty planner ends the hold here: the planner
+        // already brought the speed to zero for those.
         if (state == ST_FEED_HOLD) {
             uint32_t prev_epm = cur->events_per_mm_q8;
             cur = nullptr;
@@ -305,7 +341,7 @@ static void IRAM_ATTR stepper_isr_body() {
                 prev_epm == 0 || next->events_per_mm_q8 == 0) {
                 state = ST_HELD;
                 current_rate = 0;
-                return;
+                return woke;
             }
             load_next_block();                 // sets ST_RUNNING
             hold_start_rate = current_rate * next->events_per_mm_q8 / prev_epm;
@@ -315,7 +351,7 @@ static void IRAM_ATTR stepper_isr_body() {
             cur = nullptr;
             plan_discard_current_block();
             load_next_block();
-            if (state == ST_IDLE || state == ST_WAIT_SYNC) return;
+            if (state == ST_IDLE || state == ST_WAIT_SYNC) return woke;
         }
         // Need to compute first-step interval of the new block.
     }
@@ -329,21 +365,18 @@ static void IRAM_ATTR stepper_isr_body() {
         // so compare before subtracting rather than letting it wrap.
         uint64_t v0sq = (uint64_t)hold_start_rate * hold_start_rate;
         uint64_t drop = 2ULL * cur->accel_st * k_since_hold;
-        if (drop >= v0sq) {
+        // Stop once down to the speed a start from rest begins at (the
+        // sqrt(a/2) below). Ramping on toward zero only adds a crawl: a last
+        // step or two tens of ms apart, delaying the stop for nothing.
+        if (drop + cur->accel_st / 2 >= v0sq) {
+            end_step_pulse(pulse_start);
             state = ST_HELD;
             current_rate = 0;
-            return;
+            return wake_loop_from_isr() || woke;
         }
         rate = isqrt(v0sq - drop);
     } else {
         rate = compute_rate(events_done);
-        if (resuming) {
-            // Integer, for the same FPU reason as compute_rate().
-            uint32_t cap = isqrt((uint64_t)current_rate * current_rate
-                                 + 2ULL * cur->accel_st);
-            if (rate > cap) rate = cap;
-            else resuming = false;  // profile is below the ramp: caught up
-        }
     }
 
     if (rate == 0) {
@@ -351,20 +384,17 @@ static void IRAM_ATTR stepper_isr_body() {
         // the accel ramp is v=sqrt(2·a·k), which is zero at k=0. Falling
         // back to rate=1 gives a 1-second first-step period, which compounds
         // to 10+ s of stall on any pattern with many full-stop junctions
-        // (arc-to-arc cusps, 180° reversals, sync barriers). Use the
-        // kinematic first-step rate sqrt(a/2) — the speed you'd reach after
-        // advancing one step at constant accel from rest.
-        if (cur && cur->accel_st > 0) {
-            rate = isqrt((uint64_t)cur->accel_st / 2);
-            if (rate < 1) rate = 1;
-        } else {
-            rate = 1;
-        }
+        // (180° reversals, pen blocks). Use the kinematic first-step rate
+        // sqrt(a/2) — the speed you'd reach after advancing one step at
+        // constant accel from rest.
+        // Never 0 after this: it's a divisor below.
+        rate = (cur->accel_st > 0) ? isqrt((uint64_t)cur->accel_st / 2) : 1;
+        if (rate < 1) rate = 1;
     }
-    if (rate == 0) rate = 1;  // safety: prevent division by zero → HardFault
     current_rate = rate;
 
     uint32_t interval_us = 1000000UL / rate;
+    end_step_pulse(pulse_start);
     schedule_next_isr(interval_us);
+    return woke;
 }
-

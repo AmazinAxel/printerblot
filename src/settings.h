@@ -2,35 +2,27 @@
 
 #include "config.h"
 
-// Work area (physical envelope). Origin (0, 0) is bottom-left; +X right,
-// +Y up. Enforced as soft limits in plan_buffer_line() whenever
-// planner_soft_limits_enabled ($20) is set — see planner.h.
+// Work area (physical envelope) in machine coordinates. Enforced as soft
+// limits in plan_buffer_line() whenever planner_soft_limits_enabled ($20) is
+// set — see planner.h.
 extern float work_area_max_x_mm;
 extern float work_area_max_y_mm;
 
-// Pen servo pulse widths (µs). Extracted from the gcode modal state so
-// they persist across soft-reset (gcode_reset() no longer touches them)
-// and can be saved to flash.
+// Pen servo pulse widths (µs) for M5 (up) and M3 (down).
 extern int servo_pen_up_us;
 extern int servo_pen_down_us;
 
-// Load settings from EEPROM-on-flash. If the blob is unversioned or
-// uninitialized, compile-time defaults are kept. Call once on boot.
+// Which quality preset the settings were last set by (job.cpp), so the UI
+// shows the right one after a reboot.
+extern bool quality_poster;
+
+// Apply compile-time defaults, then whatever valid blob is on flash. Call
+// once on boot, before anything reads a setting.
 void settings_load();
 
-// Mark settings as dirty (needs writing to flash). Call after a successful
-// `$N=value`. Does NOT actually touch flash — the expensive EEPROM.commit
-// happens lazily via settings_service_save() once the stepper is idle and
-// some time has passed since the last change, so back-to-back $N= commands
-// don't each stall the main loop with a flash erase.
-void settings_mark_dirty();
+// Set setting `id` (see docs/CALIBRATION.md for the numbering). False if the
+// id is unknown or the value invalid. RAM only; settings_save() persists.
+bool settings_set(int id, float value);
 
-// Reset every settable field (planner caps, work area, servo pulses) to
-// the compile-time defaults. Does NOT touch flash — the caller should
-// `settings_mark_dirty()` afterwards if the reset should persist.
-void settings_restore_defaults();
-
-// Call from the main loop each iteration. Writes dirty settings to flash
-// if the debounce window has elapsed AND the stepper is idle (so motion
-// isn't stalled by the flash erase). No-op otherwise.
-void settings_service_save();
+// Write the settings to flash, skipped when they haven't changed.
+void settings_save();

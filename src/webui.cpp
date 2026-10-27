@@ -2,7 +2,6 @@
 
 #include <Arduino.h>
 #include <WiFi.h>
-#include "esp_netif.h"
 #include <ESPmDNS.h>
 #include <LittleFS.h>
 #include <ESPAsyncWebServer.h>
@@ -45,7 +44,7 @@ static const char *state_name() {
 // The state blob the UI renders from. Also the SSE payload; see below.
 //
 // snprintf into a caller-supplied buffer rather than building a String: this
-// runs on every progress tick and every request, and the String version did
+// runs on every progress tick and every SSE connect, and the String version did
 // ten reallocating appends plus two temporary Strings for the floats. The
 // output is bounded and small, so a stack buffer is both faster and takes no
 // heap — which matters because the parser is allocating on the same core.
@@ -81,87 +80,28 @@ static void send_ok(AsyncWebServerRequest *req, bool ok) {
               ok ? "{\"ok\":true}" : "{\"ok\":false}");
 }
 
-// True once SLAAC has handed out a routable (non-link-local) address.
-static bool have_global_ipv6(esp_ip6_addr_t *out) {
-    esp_netif_t *sta = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
-    return sta && esp_netif_get_ip6_global(sta, out) == ESP_OK;
-}
+// The only client is the homelab's proxy (flake: hosts/alechomelab/
+// services.nix), which looks this name up over IPv4 mDNS for every
+// connection. So: an A record and nothing else — no IPv6, no DNS-SD service
+// advertisement, nothing extra on the air.
+#define HOSTNAME "permablot"
 
-static void start_mdns() {
-    if (MDNS.begin(MDNS_NAME)) {
-        MDNS.addService("http", "tcp", 80);
-    }
-}
-
-// ESP-IDF's mDNS responder only ever publishes the *link-local* fe80::
-// address for IPv6 — restarting it doesn't help, that's how the component
-// builds its AAAA record. A bare fe80:: is unusable to a browser because it
-// carries no %iface scope, so permablot.local resolved to a dead address.
-//
-// Publish a second, delegated hostname whose address list we control, holding
-// the SLAAC global address (and the IPv4 one). The board is then reachable at
-// <MDNS_NAME>-v6.local with a routable AAAA record.
-static void mdns_publish_global_ipv6() {
-    static bool done = false;
-    if (done) return;
-
-    esp_ip6_addr_t g;
-    if (!have_global_ipv6(&g)) return;
-    done = true;
-
-    static char host6[64];
-    snprintf(host6, sizeof(host6), "%s-v6", MDNS_NAME);
-
-    mdns_ip_addr_t a6 = {};
-    a6.addr.type = ESP_IPADDR_TYPE_V6;
-    memcpy(a6.addr.u_addr.ip6.addr, g.addr, sizeof(g.addr));
-    a6.addr.u_addr.ip6.zone = 0; // global scope needs no zone
-    a6.next = nullptr;
-
-    if (mdns_delegate_hostname_add(host6, &a6) == ESP_OK) {
-        mdns_service_add_for_host(nullptr, "_http", "_tcp", host6, 80, nullptr, 0);
-    }
-}
-
-// Called from loop() until the connection resolves. Deliberately does NOT
-// block setup(): the HTTP server and the plotter must come up regardless, so
-// a missing router can't stop you printing over USB.
-static void wifi_service() {
-    static bool settled = false;
-    static uint32_t deadline = 0;
-
-    if (settled) return;
-
-    if (deadline == 0) deadline = millis() + 20000;
-
-    if (WiFi.status() == WL_CONNECTED) {
-        settled = true;
-        // Request a link-local + SLAAC IPv6 address. Without this the board is
-        // IPv4-only, and an mDNS client that asks for AAAA first (glibc's
-        // nss-mdns does) waits for that query to time out on every lookup —
-        // which makes permablot.local look broken even though the A record
-        // resolves fine.
-        WiFi.enableIpV6();
-        start_mdns();
-        return;
-    }
-
-    // setAutoReconnect() keeps trying in the background; the plotter still
-    // works over USB meanwhile.
-    if ((int32_t)(millis() - deadline) >= 0) settled = true;
-}
-
+// Never blocks setup(): the HTTP server comes up regardless and
+// setAutoReconnect() joins whenever the router appears (after a power cut it often boots slower
+// than the board), and ESP-IDF's mDNS responder follows the STA interface's
+// IP events itself, so it is started once here and announces on every
+// (re)connect with nothing to poll.
 static void start_wifi() {
     WiFi.mode(WIFI_STA);
-    // Start in modem-sleep. webui_service() turns it off for the duration
-    // of a print (see below) — this is the idle state, where the radio
-    // parking its receiver between beacons saves ~60-80mA and a matching
-    // amount of self-heating.
+    // Modem-sleep unless a page is open (see the /events handlers): the radio
+    // parks its receiver between beacons, saving ~60-80mA and a matching
+    // amount of self-heating. Printing doesn't need it awake — the job
+    // streams from flash on the other core.
     WiFi.setSleep(true);
     WiFi.setTxPower(WIFI_TX_POWER);
     WiFi.setAutoReconnect(true);
     WiFi.begin(WIFI_SSID, WIFI_PASS);
-    // Connection is finished in wifi_service(); see note above.
+    MDNS.begin(HOSTNAME);
 }
 
 void webui_init() {
@@ -172,40 +112,42 @@ void webui_init() {
     // so without this the UI shows whatever it saw last.
     job_set_on_change(broadcast_state);
 
+    // A dozing radio answers each request only at its next wake-up (100-300ms
+    // depending on the router), and a page makes several in a row. So the
+    // radio stays fully awake while any page is open — each holds this
+    // stream — and dozes again when the last one closes. Both callbacks run
+    // on the one async-TCP task, so the count needs no lock.
+    static int pages_open = 0;
     events.onConnect([](AsyncEventSourceClient *c) {
+        if (pages_open++ == 0) WiFi.setSleep(false);
         char buf[STATE_JSON_CAP];
         state_json(buf, sizeof(buf));
         c->send(buf, "message", millis());
     });
+    events.onDisconnect([](AsyncEventSourceClient *) {
+        if (--pages_open == 0) WiFi.setSleep(true);
+    });
     server.addHandler(&events);
 
-    server.on("/state", HTTP_GET, [](AsyncWebServerRequest *req) {
-        char buf[STATE_JSON_CAP];
-        state_json(buf, sizeof(buf));
-        req->send(200, "application/json", buf);
-    });
-
+    // Requests are applied on loop()'s core, which pushes the resulting state
+    // to every browser itself — pushing here would only resend the old one.
     server.on("/print", HTTP_POST, [](AsyncWebServerRequest *req) {
         bool ok = job_start();
         send_ok(req, ok);
-        broadcast_state();
     });
 
     server.on("/pause", HTTP_POST, [](AsyncWebServerRequest *req) {
         if (job_state() == JOB_PAUSED) job_resume(); else job_pause();
         send_ok(req, true);
-        broadcast_state();
     });
 
     server.on("/stop", HTTP_POST, [](AsyncWebServerRequest *req) {
         job_stop();
         send_ok(req, true);
-        broadcast_state();
     });
 
     server.on("/quality", HTTP_POST, [](AsyncWebServerRequest *req) {
         if (!req->hasParam("q", true)) { send_ok(req, false); return; }
-        // Applied on loop()'s core, which broadcasts the new state itself.
         send_ok(req, job_set_quality(req->getParam("q", true)->value().c_str()));
     });
 
@@ -226,7 +168,6 @@ void webui_init() {
             upload_failed = false;
             req->send(200, "application/json",
                       ok ? "{\"ok\":true}" : "{\"ok\":false,\"error\":\"write failed\"}");
-            broadcast_state();
         },
         [](AsyncWebServerRequest *req, String filename, size_t index,
            uint8_t *data, size_t len, bool final) {
@@ -249,29 +190,14 @@ void webui_init() {
         });
 
     // Static assets LAST: serveStatic("/") matches every path, so registering
-    // it before the API routes makes it swallow /state, /print and friends.
+    // it before the API routes makes it swallow /print and friends.
+    //
+    // no-cache, not max-age: the browser revalidates every load, so a fresh
+    // `uploadfs` (UI or stickers.json edits) shows up immediately instead of
+    // a day later. The files are a few KB, so the cost is nothing.
     server.serveStatic("/", LittleFS, "/www/")
           .setDefaultFile("index.html")
-          .setCacheControl("max-age=86400");
+          .setCacheControl("no-cache");
 
     server.begin();
-}
-
-// WiFi modem-sleep parks the receiver between AP beacons. That saves a lot of
-// idle power, but it also adds tens of ms of latency — which matters during a
-// print, because the planner only buffers 16 blocks and a stalled loop()
-// can't refill it. Drain that and the plot stutters. So: radio fully
-// awake while printing, asleep the rest of the time.
-static void service_wifi_power(bool printing) {
-    static bool awake = false;
-    if (printing == awake) return;
-    awake = printing;
-    WiFi.setSleep(!printing);
-}
-
-void webui_service() {
-    wifi_service();
-    mdns_publish_global_ipv6();
-    // A paused job isn't feeding, so the radio can sleep through the pause.
-    service_wifi_power(job_state() == JOB_RUNNING);
 }

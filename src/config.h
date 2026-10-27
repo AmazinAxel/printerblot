@@ -26,10 +26,12 @@ static inline void IRAM_ATTR isr_pin_write(uint8_t pin, bool level) {
     }
 }
 
-// Busy-wait on the cycle counter. Only used for the ~2µs A4988 step pulse.
-// F_CPU is 240MHz here; the count wraps but unsigned subtraction handles it.
-static inline void IRAM_ATTR isr_delay_us(uint32_t us) {
-    uint32_t start = XTHAL_GET_CCOUNT();
+// Spin until `us` have passed since cycle count `start` (XTHAL_GET_CCOUNT()).
+// The firmware's one deliberate wait: the remainder of the A4988's minimum
+// STEP high time, after the ISR has done its math during the pulse. F_CPU is
+// 240MHz whenever steps run; the count wraps but unsigned subtraction
+// handles it.
+static inline void IRAM_ATTR isr_delay_us_since(uint32_t start, uint32_t us) {
     uint32_t cycles = us * (F_CPU / 1000000);
     while ((XTHAL_GET_CCOUNT() - start) < cycles) { }
 }
@@ -59,12 +61,10 @@ static inline void IRAM_ATTR isr_delay_us(uint32_t us) {
 #define DEFAULT_MAX_RAPID_MM_MIN     16401.0f   // mm/min
 #define DEFAULT_MAX_ACCEL_MM_S2      16606.0f   // mm/s²
 #define DEFAULT_JUNCTION_DEVIATION       0.05f
-#define DEFAULT_ARC_TOLERANCE            0.002f
 
 // ───── Work envelope ─────
-// Physical Blot work area: 125 × 125 mm. Origin (0, 0) is the bottom-left
-// corner, +X right, +Y up. Homing is manual — user positions the carriage
-// at the desired origin and sends `G92 X0 Y0`.
+// Physical Blot work area: 125 × 125 mm, measured from wherever the pen sat
+// at power-on (machine 0,0). Jobs set their own origin with `G92 X0 Y0`.
 #define DEFAULT_MAX_X_MM   125.0f
 #define DEFAULT_MAX_Y_MM   125.0f
 
@@ -76,6 +76,11 @@ static inline void IRAM_ATTR isr_delay_us(uint32_t us) {
 
 // ───── Planner ─────
 #define PLANNER_BUFFER_SIZE   16        // number of blocks — must be power of 2
+// Most planner blocks one G-code line can queue: two pen commands (the
+// tokenizer allows at most two M-codes) plus one move. job_service() only
+// feeds a line when this many slots are free, so queueing never fails for
+// lack of room and nothing ever has to wait for a slot.
+#define MAX_BLOCKS_PER_LINE    3
 
 // ───── Stepper ISR ─────
 // Minimum step pulse HIGH time for A4988 (datasheet: 1 µs). We hold 2 µs.
@@ -83,29 +88,13 @@ static inline void IRAM_ATTR isr_delay_us(uint32_t us) {
 // Guard against sub-microsecond ISR re-entry; minimum scheduled interval.
 #define MIN_STEP_INTERVAL_US  25        // → max ~40 kHz step events / 500 mm/s
 
-// ───── Serial / protocol ─────
-#define SERIAL_BAUD         115200
+// ───── G-code ─────
 #define LINE_BUFFER_SIZE     96
 
-// ───── Error codes ─────
-// Numbering follows GRBL's so the values stay recognisable, but only the
-// codes this firmware actually emits are listed. tune.py just reports these
-// back to you as `error:<N>`; nothing parses them by meaning.
+// What became of a G-code line. Only the job runner looks at this: OK and
+// SKIPPED carry on, ERROR aborts the print.
 enum StatusCode : uint8_t {
-    STATUS_OK                  = 0,
-    STATUS_EXPECTED_COMMAND    = 1,
-    STATUS_BAD_NUMBER_FORMAT   = 2,
-    STATUS_INVALID_STATEMENT   = 3,
-    STATUS_NEGATIVE_VALUE      = 4,
-    STATUS_TRAVEL_EXCEEDED     = 15,  // target outside $130/$131 envelope
-    STATUS_UNSUPPORTED_COMMAND = 20,
-    STATUS_MODAL_GROUP_CONFLICT= 21,
-    STATUS_ARC_RADIUS_ERROR    = 33,
-    STATUS_OVERFLOW            = 60,
+    STATUS_OK,
+    STATUS_SKIPPED,  // unsupported but harmless (G17, M18, ...): no geometry
+    STATUS_ERROR,    // malformed, out of bounds, or would misplace geometry
 };
-
-// Realtime command bytes (intercepted before line-buffering)
-#define RT_STATUS_REPORT   '?'
-#define RT_FEED_HOLD       '!'
-#define RT_CYCLE_START     '~'
-#define RT_SOFT_RESET      0x18   // ctrl-X

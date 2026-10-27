@@ -3,12 +3,11 @@
 #include <Arduino.h>
 #include "config.h"
 
-// Parse and execute a single G-code line. Returns STATUS_OK on success or a
-// GRBL-compatible error code. The line must be null-terminated; the parser
-// strips whitespace, comments, and case. Executes immediately: linear moves
-// and arcs are queued into the planner, sync commands (servo/dwell) into
-// the sync stream, and settings ($) are applied right away.
+// Parse and execute a single G-code line (null-terminated, modified in
+// place: whitespace, comments and case are stripped). Moves and pen commands
+// are queued into the planner. The caller must have MAX_BLOCKS_PER_LINE free
+// planner slots.
 StatusCode gcode_execute_line(char *line);
 
-// Reset modal state to power-on defaults. Called on `0x18` soft reset.
+// Reset modal state (G0/G1, feedrate, G92 origin) to power-on defaults.
 void gcode_reset();

@@ -2,7 +2,8 @@
 
 Blot pen plotter firmware on a **Seeed XIAO ESP32-S3** (migrated from an
 RP2040 XIAO; the D0-D10 aliases hit the same pads, so the carrier board is
-unchanged). Hosts its own web UI — no daemon, no connected computer.
+unchanged). Hosts its own web UI — the **only** interface: no USB/serial
+input, no daemon, no connected computer.
 
 Full architecture is in [docs/FIRMWARE.md](docs/FIRMWARE.md). This file is the
 short version plus the things that bite.
@@ -11,22 +12,22 @@ short version plus the things that bite.
 
 | File | Role |
 |------|------|
-| `main.cpp` | `setup()`/`loop()`, watchdog, idle `delay(2)` |
-| `protocol.cpp` | USB line buffer + realtime bytes (`?` `!` `~` `0x18`) |
-| `gcode.cpp` | tokenizer, modal state, `$` settings, M-codes |
-| `arc.cpp` | G2/G3 → line segments (0.5mm floor) |
+| `main.cpp` | `setup()`; `loop()` = sleep until woken, then service |
+| `wake.cpp` | loop wake-ups (FreeRTOS task notification), ISR-safe |
+| `gcode.cpp` | tokenizer + the supported subset (G0/G1/G21/G90/G92/M3/M5) |
 | `planner.cpp` | 16-block ring, junction deviation, trapezoids |
-| `stepper.cpp` | step ISR: Bresenham + velocity, **integer only** |
+| `stepper.cpp` | step ISR: Bresenham + velocity, **integer only**; pen blocks; drivers; CPU clock |
 | `steptimer.cpp` | timer group 0 wrapper, IRAM |
-| `penservo.cpp` | timer group 1, manual 50Hz pulse (see below) |
-| `job.cpp` | streams `/job.gcode` into the parser, power management |
-| `webui.cpp` | WiFi, async HTTP, SSE, upload |
-| `settings.cpp` | EEPROM-emulation persistence, debounced |
+| `penservo.cpp` | timer group 1, manual 50Hz pulse; travel/hold counted in frames |
+| `job.cpp` | streams `/job.gcode` into the parser, web requests, idle release |
+| `webui.cpp` | WiFi, mDNS `permablot` (A record only), async HTTP, SSE, upload |
+| `settings.cpp` | one table of settings; EEPROM-emulation persistence |
 | `kinematics.h` | CoreXY forward/inverse + `motor_load_for_unit_dir` |
 
-Host tooling: `tune.py` (speed/accel tuning over USB), `tools/pdf2gcode.py`
-(offline PDF→gcode; the browser normally does this via `convert.js` served
-from amazinaxel.com, **not** vendored here).
+PDF→gcode happens in the browser via `convert.js` served from
+amazinaxel.com, **not** vendored here. Speed/accel calibration is to become
+a web tool, specced in [docs/CALIBRATION.md](docs/CALIBRATION.md) (it
+replaced USB `tune.py`).
 
 ## Hard constraints — violating these crashes or stutters the plot
 
@@ -37,9 +38,10 @@ from amazinaxel.com, **not** vendored here).
 2. **No `digitalWrite` / `delayMicroseconds` / `gpio_set_level` in the ISR.**
    All live in flash; an `ESP_INTR_FLAG_IRAM` handler panics with "Cache
    disabled but cached memory region accessed" as soon as anything writes to
-   flash. Use `isr_pin_write()` / `isr_delay_us()` from `config.h`.
-3. **Everything the step ISR reaches must be `IRAM_ATTR`** — including
-   `plan_get_current_block()` and `plan_discard_current_block()`.
+   flash. Use `isr_pin_write()` / `isr_delay_us_since()` from `config.h`.
+3. **Everything the ISRs reach must be `IRAM_ATTR`** — including
+   `plan_get_current_block()`, `plan_discard_current_block()` and
+   `wake_loop_from_isr()`.
 4. **The pen servo can't use PWM.** It's on D6 = GPIO43 (UART0); the LEDC
    matrix can't route there, so `Servo`/ESP32Servo hangs in `attach()`.
    `penservo.cpp` bit-bangs 50Hz from a hardware timer instead. There is
@@ -47,24 +49,41 @@ from amazinaxel.com, **not** vendored here).
 5. **CoreXY: pure X/Y are the *fastest* directions, ±45° the slowest** —
    inverse of a Cartesian machine. `$112`/`$122` are motor-space caps and
    bind first on diagonals (`$112`/√2).
+6. **Event-driven: no polling, no delays, no software timers.** `loop()`
+   sleeps in `wake_wait()`; anything that changes state the loop must act on
+   wakes it (step ISR: slot freed / pen block / stopped; servo ISR: pen
+   arrived; HTTP: requests). A new state change without a wake is a hang —
+   the host sim's tests catch these. The one wait is the sub-2µs remainder
+   of the STEP pulse inside the ISR.
 
 ## Design decisions worth not re-litigating
 
-- **GRBL sender compatibility was deliberately removed** (Oct 2025). No
-  welcome banner, no `$I`/`$G`/`$J`/`$X`/`$H`/`$C`/`$N`/`$SLP`, no `$0-$32`
-  stubs, no jog-cancel, no `Z` field in `MPos`. The only consumer is
-  `tune.py`, which needs exactly: `ok\r\n`, `error:<n>\r\n`, `$$` dump, and
-  `<State|MPos:x,y|FS:f,0>`. Don't re-add GRBL surface without a consumer.
-- **Settings persist**, flushed lazily (500ms debounce + stepper idle) and
-  skipped when the blob is unchanged — flash is ~100k erase cycles and the UI
-  re-sends the whole quality preset on every toggle.
-- **Motors auto-release when idle**, auto-enable on motion. The enable is
-  *queued through the planner*, never written directly — parsing runs far
-  ahead of execution, so a direct write re-energises during an M18 drain.
-- **Soft reset preserves motor position** (the motors are physically wherever
+- **USB is gone** (Oct 2026): no serial protocol, no `$` commands, no
+  realtime bytes, `ARDUINO_USB_CDC_ON_BOOT=0`. Printing is web upload only.
+- **G-code is the generators' subset.** Unknown-but-harmless codes are
+  skipped; anything that would misplace geometry (arcs, G20, G91, G28...) or
+  an out-of-bounds move stops the print. Don't add codes without a consumer.
+- **A line queues ≤ `MAX_BLOCKS_PER_LINE`** (2 pen + 1 move), and the feeder
+  only parses with that many slots free, so nothing waits for a slot.
+- **Settings persist**, written immediately by `settings_save()` and skipped
+  when the blob is unchanged — flash is ~100k erase cycles and the UI
+  re-sends the whole quality preset on every toggle. The quality name lives
+  in former padding of the blob, so old blobs still load.
+- **Motors**: enabled directly when a job starts, released directly once
+  there's no job and nothing queued; a paused job keeps holding.
+- **A stop preserves motor position** (the motors are physically wherever
   they are); the planner is re-anchored to it, not to a phantom 0,0.
-- **`job_service()` fills the planner** rather than one line per loop —
+- **`job_service()` fills the planner** rather than one line per wake —
   lookahead needs depth to carry speed through a corner.
+- **No loop watchdog**: the loop sleeps indefinitely by design.
+- **Reached via the homelab, not directly.** Clients don't resolve `.local`;
+  `alechomelab:8000` (flake `hosts/alechomelab/services.nix`) is a
+  socket-activated `systemd-socket-proxyd` to `permablot.local:80`, tailnet
+  only. So the firmware publishes an IPv4 mDNS A record and nothing else —
+  no IPv6, no DNS-SD. The hostname is hardcoded on both sides.
+- **CPU runs 80MHz when fully idle**, 240MHz before any motion
+  (`stepper_wake()`): the step ISR's timing assumes `F_CPU`. WiFi is in
+  modem-sleep except while a page holds /events open (event-driven).
 - **No `String` in the job feed path.** Tens of thousands of lines × 2 heap
   allocs, competing with WiFi for a ~320KB heap.
 
@@ -82,8 +101,7 @@ from amazinaxel.com, **not** vendored here).
 - Migrating means the `pioarduino` fork (core 3.x / IDF 5.x). That fork is
   mature and widely used, but it drags in `EEPROM`→`Preferences` and
   ESPAsyncWebServer API drift *at the same time* as rewriting the step ISR —
-  the code with the IRAM/no-FPU constraints above — with no test suite and no
-  runtime verification available here.
+  the code with the IRAM/no-FPU constraints above.
 
 **Revisit when something pulls you**: needing a newer WiFi stack, a security
 fix, or a library that requires core 3.x. Then do it as one motivated,
@@ -91,16 +109,13 @@ bench-tested migration. Pin an exact release tag, not `stable`.
 
 ## Known-unfixed
 
-- **Feed hold decelerates across blocks but parks at sync blocks** (pen,
-  dwell). Job Stop uses it, so it decelerates before flushing the planner.
+- **Feed hold decelerates across blocks but parks at pen blocks.** Job Stop
+  uses it, so it decelerates before flushing the planner.
 - **Soft limits are enforced** (`$20`, default on) in `plan_buffer_line()` —
-  the single choke point all motion routes through. Arcs are bounds-checked
-  as a whole *before* any segment is queued, using the exact arc bounding box
-  (endpoints + whichever axis crossings the sweep reaches), so a rejected arc
-  draws nothing rather than stranding the pen mid-curve. Out-of-range moves
-  return `error:15`; in a job that aborts the print rather than silently
-  skipping lines. Limits are on **machine** coordinates, so a `G92` origin
-  set far across the bed legitimately shrinks the drawable area.
+  the single choke point all motion routes through. An out-of-range move
+  stops the print rather than being skipped. Limits are on **machine**
+  coordinates (0,0 = pen position at power-on), so a `G92` origin set far
+  across the bed legitimately shrinks the drawable area.
 
 ## Build / verify
 
@@ -108,9 +123,15 @@ bench-tested migration. Pin an exact release tag, not `stable`.
 pio run              # compile (must be warning-free; -Wall on src/ only)
 pio run -t upload    # firmware
 pio run -t uploadfs  # web UI from data/ → LittleFS
+nix shell nixpkgs#gcc -c test/host/run.sh   # host simulation, all tests
 ```
 
-`src/wifi_config.h` is required and gitignored (hard `#error` if missing).
-There is **no test suite** — it was deleted along with the RP2040 port, so
-`pio run` plus bench-testing on hardware is the only verification. No
-`python3` on this NixOS box by default, so the Python tools can't be run here.
+`src/wifi_config.h` is required and gitignored (hard `#error` if missing) —
+the real one holds credentials, never overwrite it. `pio`: `nix shell
+nixpkgs#platformio -c pio run`.
+
+`test/host/` is the test suite: it compiles the real firmware modules against
+stubs (`test/host/stub/`) and simulates time, both timers, pins, flash and
+the loop's wake-ups, checking every pin edge and each job end to end. It
+can't model real cycle timing inside an ISR, so bench-testing on hardware is
+still the last word.

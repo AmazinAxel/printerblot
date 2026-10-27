@@ -12,23 +12,22 @@
 // The Blot carrier board can't be rewired, so instead of PWM we generate the
 // 50Hz servo pulse from a hardware timer and a plain GPIO write, which GPIO43
 // does support. A servo only needs a 1000-2000µs pulse every 20ms; that's two
-// timer callbacks, and the jitter tolerance is milliseconds, so this is well
-// within reach even alongside the step ISR.
-
-void penservo_init(uint8_t pin, uint16_t initial_us = 0);
-
-// Command a pulse width in microseconds (1000 = one end, 2000 = the other).
-void penservo_write_us(uint16_t us);
-
-uint16_t penservo_current_us();
-
-// Called from loop(). Stops the pulse train once the pen has had time to
-// reach its commanded position.
+// timer interrupts per frame, and the jitter tolerance is milliseconds.
 //
-// A hobby servo holds position only while it's being pulsed, and holding is
-// its worst case: the motor stays powered and hunts around the setpoint,
-// buzzing and wearing the gear train and feedback pot. The pen has no load
-// to hold — it rests either up or down — so once it has arrived there's
-// nothing to gain from continuing to drive it. The next write_us() restarts
-// the train automatically.
-void penservo_service();
+// Everything time-based is counted in those 20ms frames by the servo's own
+// interrupt — no software timers, nothing for loop() to poll:
+//   - travel: DEFAULT_PEN_MOVE_MS after a new target, the ISR flags the pen
+//     as arrived and wakes the loop (see wake.h);
+//   - hold: a hobby servo only holds while pulsed, and holding is its worst
+//     case (powered, hunting around the setpoint, wearing the gears). The pen
+//     has no load to hold, so after SERVO_HOLD_MS the ISR simply stops
+//     re-arming itself and leaves the line low. The next move restarts it.
+
+void penservo_init(uint8_t pin, uint16_t initial_us);
+
+// Command a pulse width in µs (1000 = one end, 2000 = the other). Returns
+// true if the target changed, i.e. the pen has to travel: the loop is woken
+// once it has arrived (penservo_arrived()). False means it's already there.
+bool penservo_move(uint16_t us);
+
+bool penservo_arrived();

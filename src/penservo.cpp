@@ -3,6 +3,7 @@
 #include <Arduino.h>
 
 #include "config.h"
+#include "wake.h"
 
 #include "driver/timer.h"
 #include "esp_attr.h"
@@ -16,35 +17,67 @@
 
 #define SERVO_FRAME_US 20000  // 50Hz refresh, standard for hobby servos
 
+// How long to keep pulsing after a command before going quiet. Must
+// comfortably exceed the travel time, so allow a healthy margin over it.
+#define SERVO_HOLD_MS  400
+
+// Counted on falling edges: the travel time is over once this many pulses
+// of the new width have gone out (their first rising edge + 60ms, rounded up
+// to whole frames). A pulse already in flight when the target changes still
+// has the old width and is counted on top.
+#define SETTLE_FRAMES (DEFAULT_PEN_MOVE_MS * 1000 / SERVO_FRAME_US + 1)
+#define HOLD_FRAMES   (SERVO_HOLD_MS * 1000 / SERVO_FRAME_US)
+
 static uint8_t  s_pin = 0;
 static volatile uint16_t s_pulse_us = 1000;
 static volatile bool     s_high = false;
+static volatile bool     s_active = false;  // pulse train running
+static volatile uint8_t  s_settle_frames = 0;  // until arrival; 0 = arrived
+static volatile uint8_t  s_hold_frames = 0;    // until the train goes quiet
+
+static inline void IRAM_ATTR arm_in_isr(uint32_t delay_us) {
+    uint64_t now = timer_group_get_counter_value_in_isr(SERVO_TG, SERVO_IDX);
+    timer_group_set_alarm_value_in_isr(SERVO_TG, SERVO_IDX, now + delay_us);
+    timer_group_enable_alarm_in_isr(SERVO_TG, SERVO_IDX);
+}
 
 // Pin writes go through isr_pin_write() from config.h. gpio_set_level() lives
 // in flash, so calling it from an ESP_INTR_FLAG_IRAM handler panics with
 // "Cache disabled but cached memory region accessed" the moment anything
 // writes to flash.
-#define pin_write isr_pin_write
-
-// Emits the pulse: go high, schedule the fall; go low, schedule the next
-// frame. Two interrupts per 20ms frame — negligible next to the step ISR.
+//
+// Emits the pulse: go high, schedule the fall; go low, count the frame and
+// schedule the next one — or, once the hold is over, schedule nothing and
+// leave the line low. The alarm doesn't re-enable itself, so not re-arming
+// is all it takes to go quiet.
 static bool IRAM_ATTR servo_isr(void *) {
-    uint32_t next;
-    if (s_high) {
-        // End of the pulse: drop the line, wait out the rest of the frame.
-        pin_write(s_pin, false);
-        s_high = false;
-        next = SERVO_FRAME_US - s_pulse_us;
-    } else {
-        pin_write(s_pin, true);
+    if (!s_high) {
+        isr_pin_write(s_pin, true);
         s_high = true;
-        next = s_pulse_us;
+        arm_in_isr(s_pulse_us);
+        return false;
     }
 
-    uint64_t now = timer_group_get_counter_value_in_isr(SERVO_TG, SERVO_IDX);
-    timer_group_set_alarm_value_in_isr(SERVO_TG, SERVO_IDX, now + next);
-    timer_group_enable_alarm_in_isr(SERVO_TG, SERVO_IDX);
-    return false;
+    isr_pin_write(s_pin, false);
+    s_high = false;
+
+    bool woke = false;
+    if (s_settle_frames && --s_settle_frames == 0) woke = wake_loop_from_isr();
+    if (--s_hold_frames == 0) {
+        s_active = false;
+        return woke;
+    }
+    arm_in_isr(SERVO_FRAME_US - s_pulse_us);
+    return woke;
+}
+
+// Start the pulse train from rest: first rising edge almost immediately.
+static void start_train() {
+    s_high = false;
+    uint64_t now = 0;
+    timer_get_counter_value(SERVO_TG, SERVO_IDX, &now);
+    timer_set_alarm_value(SERVO_TG, SERVO_IDX, now + 100);
+    timer_set_alarm(SERVO_TG, SERVO_IDX, TIMER_ALARM_EN);
 }
 
 void penservo_init(uint8_t pin, uint16_t initial_us) {
@@ -53,7 +86,9 @@ void penservo_init(uint8_t pin, uint16_t initial_us) {
     // first pulse already commands the resting (pen-up) position. Otherwise
     // it would see the default and snap there, then move again — a visible
     // double twitch at power-up.
-    if (initial_us) penservo_write_us(initial_us);
+    s_pulse_us = initial_us;
+    s_hold_frames = HOLD_FRAMES;
+    s_active = true;
 
     // Plain GPIO output. GPIO43/44 are valid outputs (only 22-25 are not on
     // the S3); it's specifically the LEDC PWM matrix that can't reach them.
@@ -79,46 +114,24 @@ void penservo_init(uint8_t pin, uint16_t initial_us) {
     timer_isr_callback_add(SERVO_TG, SERVO_IDX, servo_isr, nullptr,
                            ESP_INTR_FLAG_IRAM);
     timer_start(SERVO_TG, SERVO_IDX);
-
-    // Kick off the first frame.
-    timer_set_alarm_value(SERVO_TG, SERVO_IDX, SERVO_FRAME_US);
-    timer_set_alarm(SERVO_TG, SERVO_IDX, TIMER_ALARM_EN);
+    start_train();
 }
 
-// How long to keep pulsing after a move before going quiet. Must comfortably
-// exceed the servo's travel time; DEFAULT_PEN_MOVE_MS (60ms) is the figure the
-// motion code already waits, so allow a healthy margin over it.
-#define SERVO_HOLD_MS 400
-
-static volatile uint32_t s_last_cmd_ms = 0;
-static volatile bool     s_idle = false;
-
-void penservo_write_us(uint16_t us) {
+bool penservo_move(uint16_t us) {
     if (us < 500)  us = 500;
     if (us > 2500) us = 2500;
-    s_pulse_us = us; // picked up by the next frame
-    s_last_cmd_ms = millis();
-
-    if (s_idle) {
-        // Restart the pulse train: re-arm the timer and resume framing.
-        s_idle = false;
-        s_high = false;
-        uint64_t now = 0;
-        timer_get_counter_value(SERVO_TG, SERVO_IDX, &now);
-        timer_set_alarm_value(SERVO_TG, SERVO_IDX, now + 100);
-        timer_set_alarm(SERVO_TG, SERVO_IDX, TIMER_ALARM_EN);
-    }
+    // The servo ISR runs on this core, so masking interrupts makes the
+    // counter update atomic with respect to it.
+    noInterrupts();
+    bool travel = us != s_pulse_us;
+    s_pulse_us = us;  // picked up by the next frame
+    s_settle_frames = travel ? SETTLE_FRAMES + s_high : 0;
+    s_hold_frames = HOLD_FRAMES;
+    bool restart = !s_active;
+    s_active = true;
+    interrupts();
+    if (restart) start_train();
+    return travel;
 }
 
-void penservo_service() {
-    if (s_idle) return;
-    if ((int32_t)(millis() - s_last_cmd_ms) < SERVO_HOLD_MS) return;
-
-    // Pen has arrived. Stop pulsing and leave the line low so the servo
-    // de-energises instead of hunting against its setpoint indefinitely.
-    s_idle = true;
-    timer_set_alarm(SERVO_TG, SERVO_IDX, TIMER_ALARM_DIS);
-    pin_write(s_pin, false);
-}
-
-uint16_t penservo_current_us() { return s_pulse_us; }
+bool penservo_arrived() { return s_settle_frames == 0; }

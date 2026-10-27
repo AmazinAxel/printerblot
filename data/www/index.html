@@ -10,6 +10,8 @@
   <!-- Shared styling from amazinaxel.com, same sheets and load order as the
        site's +layout.svelte, so the plotter UI restyles along with the site. -->
   <link rel="preconnect" href="https://amazinaxel.com" crossorigin>
+  <link rel="preload" as="font" type="font/woff2" crossorigin href="https://amazinaxel.com/fonts/sora.woff2">
+  <link rel="preload" as="font" type="font/woff2" crossorigin href="https://amazinaxel.com/fonts/hammersmith-one.woff2">
   <link rel="stylesheet" href="https://amazinaxel.com/css/vars.css">
   <link rel="stylesheet" href="https://amazinaxel.com/css/layout.css">
   <link rel="stylesheet" href="https://amazinaxel.com/css/typography.css">
@@ -19,14 +21,17 @@
   <style>
     /* typography.css declares its fonts as /fonts/*.woff2, which resolve
        against the plotter's own origin and 404. Re-declare with absolute
-       URLs; these win because they come after the linked sheet. */
+       URLs; these win because they come after the linked sheet.
+       font-display: optional, not swap: a font arriving after first paint
+       would reflow every line (layout shift). Preloaded above, so it's
+       normally in time; if not, the fallback stays for this visit. */
     @font-face {
       font-family: 'Hammersmith One'; font-style: normal; font-weight: 200;
-      font-display: swap;
+      font-display: optional;
       src: url(https://amazinaxel.com/fonts/hammersmith-one.woff2) format('woff2');
     }
     @font-face {
-      font-family: 'Sora'; font-style: normal; font-display: swap;
+      font-family: 'Sora'; font-style: normal; font-display: optional;
       src: url(https://amazinaxel.com/fonts/sora.woff2) format('woff2');
     }
 
@@ -46,7 +51,17 @@
     button.secondary { background: var(--darkest3); }
     button.danger { background: var(--red); }
     button:disabled { opacity: .5; cursor: default; }
-    #uplog, #status { font-size: .9rem; color: var(--lightest3); margin-top: .6rem; }
+    #uplog, #stlog, #status { font-size: .9rem; color: var(--lightest3); margin-top: .6rem; }
+    select { font-size: 1rem; }
+    /* The site sheet gives textareas a 10px margin and a 200px min-width,
+       which push a full-width one past the card's padding. */
+    textarea { width: 100%; margin: 0; min-width: 0; font-size: .9rem; resize: vertical; box-sizing: border-box; }
+    #stgrid { display: grid; gap: .4rem; }
+    /* A class or id that sets display (flex rows, the grid) beats the hidden
+       attribute's default, so hidden things showed anyway — e.g. the
+       quality choice during a print. */
+    [hidden] { display: none !important; }
+    #stgrid textarea { min-height: 3.5rem; }
     progress {
       width: 100%; height: .5rem; margin-top: .6rem;
       accent-color: var(--blue2);
@@ -60,7 +75,7 @@
   <!-- upload -->
   <div class="innerCard">
     <h2>Upload</h2>
-    <form id="up" class="stack">
+    <form id="up" class="stack" autocomplete="off">
       <input type="file" name="pdf" accept="application/pdf,.gcode" required>
       <div class="row">
         <label>Threshold <input type="number" name="threshold" value="128" min="0" max="255"></label>
@@ -74,32 +89,54 @@
         <input type="checkbox" name="nocrop">
         No crop
       </label>
-      <div><button id="upbtn" type="submit">Convert &amp; upload</button></div>
+      <div><button id="upbtn" type="submit">Upload</button></div>
     </form>
     <div id="uplog"></div>
   </div>
 
+  <!-- text -->
+  <div class="innerCard">
+    <h2>Text</h2>
+    <form id="st" class="stack" autocomplete="off">
+      <div class="row">
+        <label>Sheet <select name="sheet"></select></label>
+        <label>Font <select name="font"></select></label>
+        <label>Padding <input type="number" name="padding" step="0.5" min="0"></label>
+      </div>
+      <div class="row">
+        <label><input type="radio" name="mode" value="repeat" checked> Repeat text</label>
+        <label><input type="radio" name="mode" value="each"> Different text</label>
+      </div>
+      <textarea id="sttext" rows="4" placeholder="Text"></textarea>
+      <div id="stgrid" hidden></div>
+      <div><button id="stbtn" type="submit">Upload</button></div>
+    </form>
+    <div id="stlog"></div>
+  </div>
+
   <!-- machine control -->
   <div class="innerCard">
-    <h2>Machine control</h2>
+    <h2>Print</h2>
     <span id="status"></span>
     <progress id="prog" value="0" max="100" hidden></progress>
     <div id="controls" class="row" style="margin-top:.6rem"></div>
     <!-- Only shown while idle: quality applies to the next job, so changing
          it mid-print would be misleading. -->
     <div id="quality" class="row" style="margin-top:.9rem">
-      <label><input type="radio" name="q" value="draft"> Draft</label>
-      <label><input type="radio" name="q" value="poster"> Poster</label>
+      <label><input type="radio" name="q" value="draft" autocomplete="off"> Draft</label>
+      <label><input type="radio" name="q" value="poster" autocomplete="off"> Poster</label>
     </div>
   </div>
 </div>
 
 <script type="module">
-  // Served from the site, not the board: keeps the XIAO's flash and its
-  // uplink free for gcode. Update it there, not here.
-  import { convertPdf } from "https://amazinaxel.com/js/convert.js";
+  // convert.js is served from the site, not the board: keeps the XIAO's
+  // flash and its uplink free for gcode. Update it there, not here. Imported
+  // only when a PDF is converted — a static import would hold back this
+  // whole script, and with it every restore below, until it downloaded.
+  const CONVERT = "https://amazinaxel.com/js/convert.js";
 
-const PDFJS = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.10.38";
+  const PDFJS = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.10.38";
   let pdfjsReady = null;
 
   function loadPdfJs() {
@@ -108,29 +145,53 @@ const PDFJS = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.10.38";
       lib.GlobalWorkerOptions.workerSrc = `${PDFJS}/pdf.worker.min.mjs`;
     }).catch((e) => {
       pdfjsReady = null; // let a later attempt retry
-      throw new Error("Couldn't load the PDF library. " +
-                      "You can still upload a .gcode file");
+      throw e;
     });
     return pdfjsReady;
   }
 
   const $ = (s) => document.querySelector(s);
 
+  // ───── Saved form state ─────
+  // Everything typed or picked is kept in this browser (localStorage) and
+  // put back on load, so a refresh or a new session loses nothing. The forms
+  // are autocomplete="off" so the browser's own form restore can't bring
+  // back a half-state behind the script's back (the "different text" radio
+  // without its boxes, say): this is the only restore, and it always
+  // re-derives what's shown from what's restored. Also kept: the last
+  // stickers.json (here) and machine state (its own small entry, as it
+  // changes ~100 times a print), shown until the board's arrive. Not saved:
+  // the chosen file (browsers can't restore those).
+  const ui = (() => {
+    try { return JSON.parse(localStorage.getItem("permablot-ui")) || {}; }
+    catch { return {}; }
+  })();
+  function saveUi() {
+    try { localStorage.setItem("permablot-ui", JSON.stringify(ui)); } catch {}
+  }
+
+  // Restore a field from `ui[key]`, then keep it saved as it changes.
+  function persist(el, key) {
+    const box = el.type === "checkbox";
+    if (key in ui) box ? (el.checked = ui[key]) : (el.value = ui[key]);
+    el.addEventListener(box ? "change" : "input", () => {
+      ui[key] = box ? el.checked : el.value;
+      saveUi();
+    });
+  }
+
   async function post(url, body) {
     const r = await fetch(url, body ? { method: "POST", body } : { method: "POST" });
     return r.json().catch(() => ({}));
   }
 
+  let shownState = null;
+
   function render(s) {
-    const label = s.state === "idle" ? "Not running"
-                : s.state[0].toUpperCase() + s.state.slice(1);
     $("#status").textContent =
-      (s.state === "idle")
-        ? (s.error
-             ? "Stopped on an error in the file (usually a move outside " +
-               "the work area). Move to origin and try again!"
-             : "Ready")
-        : label;
+      s.state === "running" ? "Printing" :
+      s.state === "paused"  ? "Paused"   :
+      s.error               ? "Failed"   : "Ready";
 
     const prog = $("#prog");
     prog.hidden = s.state === "idle";
@@ -143,6 +204,10 @@ const PDFJS = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.10.38";
       el.checked = el.value === s.quality;
     }
 
+    // Progress ticks arrive ~100 times a job; only a state change needs
+    // new buttons.
+    if (s.state === shownState) return;
+    shownState = s.state;
     const c = $("#controls");
     if (s.state === "idle") {
       c.innerHTML = '<button id="bprint">Print</button>';
@@ -162,48 +227,298 @@ const PDFJS = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.10.38";
       post("/quality", new URLSearchParams({ q: el.value })));
   }
 
-  $("#up").addEventListener("submit", async (e) => {
+  for (const k of ["threshold", "scale", "dpi", "margin", "nocrop"])
+    persist($("#up")[k], k);
+
+  // Both forms upload the same way, and say only one of three things:
+  // Uploading..., Ready to print, or Failed.
+  async function upload(btn, status, makeGcode) {
+    const say = (m) => ($(status).textContent = m);
+    $(btn).disabled = true;
+    say("Uploading...");
+    try {
+      const body = new FormData();
+      body.append("gcode", new Blob([await makeGcode()], { type: "text/plain" }), "job.gcode");
+      say((await post("/upload", body)).ok ? "Ready to print" : "Failed");
+    } catch {
+      say("Failed");
+    } finally {
+      $(btn).disabled = false;
+    }
+  }
+
+  $("#up").addEventListener("submit", (e) => {
     e.preventDefault();
     const form = $("#up");
     const file = form.pdf.files[0];
     if (!file) return;
-
-    $("#upbtn").disabled = true;
-    const log = (m) => ($("#uplog").textContent = m);
-
-    try {
-      let gcode;
-      if (file.name.toLowerCase().endsWith(".gcode")) {
-        log("Reading gcode...");
-        gcode = await file.text();
-      } else {
-        log("Loading PDF library...");
-        await loadPdfJs();
-        const res = await convertPdf(file, {
-          threshold: +form.threshold.value,
-          scale: +form.scale.value,
-          dpi: +form.dpi.value,
-          margin: +form.margin.value,
-          nocrop: form.nocrop.checked,
-        }, log);
-        gcode = res.gcode;
-        log(`Uploading ${res.paths} paths (${(gcode.length / 1024).toFixed(0)} KB)…`);
-      }
-
-      const body = new FormData();
-      body.append("gcode", new Blob([gcode], { type: "text/plain" }), "job.gcode");
-      const r = await post("/upload", body);
-      log(r.ok ? "Ready to print." : "Error: " + (r.error || "upload failed"));
-    } catch (err) {
-      log("Error: " + err.message);
-    } finally {
-      $("#upbtn").disabled = false;
-    }
+    upload("#upbtn", "#uplog", async () => {
+      if (file.name.toLowerCase().endsWith(".gcode")) return file.text();
+      const [{ convertPdf }] = await Promise.all([import(CONVERT), loadPdfJs()]);
+      const res = await convertPdf(file, {
+        threshold: +form.threshold.value,
+        scale: +form.scale.value,
+        dpi: +form.dpi.value,
+        margin: +form.margin.value,
+        nocrop: form.nocrop.checked,
+      }, () => {});  // no progress messages
+      return res.gcode;
+    });
   });
 
+  // ───── Text ─────
+  // Sheet presets live in stickers.json on the board (hand-edited, flashed
+  // with uploadfs); the fonts themselves come from the site like convert.js.
+  const OPENTYPE = "https://cdnjs.cloudflare.com/ajax/libs/opentype.js/1.3.4/opentype.min.js";
+  const FEED = 4000, RAPID = 16000; // mm/min
+  const CHORD_MM = 0.2;             // bezier flattening step
+  let stickers = { fonts: {}, sheets: [] };
+  let opentypeReady = null;
+  const fontCache = {};
+
+  function loadOpentype() {
+    opentypeReady ??= new Promise((ok, fail) => {
+      const s = document.createElement("script");
+      s.src = OPENTYPE;
+      s.onload = ok;
+      s.onerror = () => { opentypeReady = null; fail(new Error("opentype")); };
+      document.head.appendChild(s);
+    });
+    return opentypeReady;
+  }
+
+  function loadFont(name) {
+    fontCache[name] ??= fetch(stickers.fonts[name])
+      .then((r) => {
+        if (!r.ok) throw new Error(r.status);
+        return r.arrayBuffer();
+      })
+      .then((buf) => opentype.parse(buf))
+      .catch((e) => { delete fontCache[name]; throw e; });
+    return fontCache[name];
+  }
+
+  const st = $("#st");
+  const sheet = () => stickers.sheets[st.sheet.value];
+  const mode = () => st.mode.value;
+
+  // One box per sticker. Each sheet remembers its own texts (ui.grid, keyed
+  // by sheet name), so switching sheets and back loses nothing.
+  function buildGrid() {
+    const g = $("#stgrid");
+    const s = sheet();
+    if (!s) return;
+    ui.grid ??= {};
+    const texts = (ui.grid[s.name] ??= []);
+    g.style.gridTemplateColumns = `repeat(${s.columns}, minmax(0, 1fr))`;
+    g.innerHTML = "";
+    for (let i = 0; i < s.rows * s.columns; i++) {
+      const t = document.createElement("textarea");
+      t.placeholder = `Row ${Math.floor(i / s.columns) + 1}, column ${i % s.columns + 1}`;
+      t.value = texts[i] ?? "";
+      t.addEventListener("input", () => { texts[i] = t.value; saveUi(); });
+      g.appendChild(t);
+    }
+  }
+
+  function syncMode() {
+    $("#sttext").hidden = mode() !== "repeat";
+    $("#stgrid").hidden = mode() !== "each";
+  }
+
+  // Flatten an opentype path (y-down, mm) into polylines.
+  function flatten(cmds) {
+    const polys = [];
+    let cur = null, x = 0, y = 0, sx = 0, sy = 0;
+    const steps = (len) => Math.max(2, Math.ceil(len / CHORD_MM));
+    for (const c of cmds) {
+      if (c.type === "M") {
+        if (cur && cur.length > 1) polys.push(cur);
+        cur = [[c.x, c.y]]; x = sx = c.x; y = sy = c.y;
+      } else if (c.type === "L") {
+        cur.push([c.x, c.y]); x = c.x; y = c.y;
+      } else if (c.type === "Q") {
+        const n = steps(Math.hypot(c.x1 - x, c.y1 - y) + Math.hypot(c.x - c.x1, c.y - c.y1));
+        for (let i = 1; i <= n; i++) {
+          const t = i / n, u = 1 - t;
+          cur.push([u * u * x + 2 * u * t * c.x1 + t * t * c.x,
+                    u * u * y + 2 * u * t * c.y1 + t * t * c.y]);
+        }
+        x = c.x; y = c.y;
+      } else if (c.type === "C") {
+        const n = steps(Math.hypot(c.x1 - x, c.y1 - y) + Math.hypot(c.x2 - c.x1, c.y2 - c.y1) +
+                        Math.hypot(c.x - c.x2, c.y - c.y2));
+        for (let i = 1; i <= n; i++) {
+          const t = i / n, u = 1 - t;
+          cur.push([u * u * u * x + 3 * u * u * t * c.x1 + 3 * u * t * t * c.x2 + t * t * t * c.x,
+                    u * u * u * y + 3 * u * u * t * c.y1 + 3 * u * t * t * c.y2 + t * t * t * c.y]);
+        }
+        x = c.x; y = c.y;
+      } else if (c.type === "Z") {
+        if (cur) {
+          if (x !== sx || y !== sy) cur.push([sx, sy]);
+          if (cur.length > 1) polys.push(cur);
+        }
+        cur = null; x = sx; y = sy;
+      }
+    }
+    if (cur && cur.length > 1) polys.push(cur);
+    return polys;
+  }
+
+  // Lay text out as big as fits in the box, left/top-aligned. Returns
+  // polylines in page coordinates (mm): x across, y down the paper from its
+  // top-left corner, same as the font's y. stickersToGcode() maps them on.
+  //
+  // Fitted to the ink actually drawn — the flattened points themselves — not
+  // to the font's nominal metrics: glyphs overhang their advance width and
+  // rise past the ascender, which would spill over the sticker's edge. So
+  // whatever the text, line count or sheet shape, every point lands inside
+  // the box and the text fills it in its limiting direction.
+  function layoutSticker(font, text, left, top, boxW, boxH) {
+    const lines = text.replace(/\s+$/, "").split("\n");
+    const lh = (font.ascender - font.descender) / font.unitsPerEm;
+    const draw = (size) => lines.flatMap((line, i) =>
+      flatten(font.getPath(line, 0, (i + 1) * lh * size, size).commands));
+    const bounds = (polys) => {
+      let x1 = Infinity, y1 = Infinity, x2 = -Infinity, y2 = -Infinity;
+      for (const p of polys) for (const [x, y] of p) {
+        x1 = Math.min(x1, x); x2 = Math.max(x2, x);
+        y1 = Math.min(y1, y); y2 = Math.max(y2, y);
+      }
+      return [x1, y1, x2, y2];
+    };
+    const fit = ([x1, y1, x2, y2]) => Math.min(
+      x2 > x1 ? boxW / (x2 - x1) : Infinity, y2 > y1 ? boxH / (y2 - y1) : Infinity);
+
+    // A pass at size 1 finds roughly how big; the real pass is drawn at that
+    // size, so curves are flattened at the right step, then fitted exactly.
+    let polys = draw(1);
+    const rough = fit(bounds(polys));
+    if (!isFinite(rough)) return [];  // no ink (blank or spaces)
+    polys = draw(rough);
+    const b = bounds(polys), k = fit(b);
+    return polys.map((p) => p.map(([x, y]) => [left + (x - b[0]) * k, top + (y - b[1]) * k]));
+  }
+
+  // Greedy nearest-neighbour so the pen doesn't zig-zag between glyphs.
+  function order(polys, from) {
+    const out = [];
+    const left = polys.slice();
+    let [cx, cy] = from;
+    while (left.length) {
+      let bi = 0, bd = Infinity;
+      left.forEach((p, i) => {
+        const d = (p[0][0] - cx) ** 2 + (p[0][1] - cy) ** 2;
+        if (d < bd) { bd = d; bi = i; }
+      });
+      const p = left.splice(bi, 1)[0];
+      out.push(p);
+      [cx, cy] = p[p.length - 1];
+    }
+    return out;
+  }
+
+  const f3 = (v) => v.toFixed(3);
+
+  // Page → machine: the paper's top-left sits at the plotter's top-left (the
+  // pen's rest), with the page's across and down running along the
+  // machine's Y and X. So every point goes out as X = page y, Y = page x.
+
+  function stickersToGcode(font, s, texts, pad) {
+    const boxW = s.width - 2 * pad, boxH = s.height - 2 * pad;
+    if (boxW <= 0 || boxH <= 0) throw new Error("padding");
+    const g = ["G92 X0 Y0", "M5"];
+    let pos = [0, 0];
+    for (let r = 0; r < s.rows; r++) {
+      for (let c = 0; c < s.columns; c++) {
+        const text = texts[r * s.columns + c];
+        if (!text || !text.trim()) continue;
+        const x0 = (s.offsetX ?? 0) + c * (s.width + s.gapX);
+        const y0 = (s.offsetY ?? 0) + r * (s.height + s.gapY);
+        const polys = order(layoutSticker(font, text, x0 + pad, y0 + pad, boxW, boxH), pos);
+        for (const p of polys) {
+          g.push(`G1 X${f3(p[0][1])} Y${f3(p[0][0])} F${RAPID}`, "M3");
+          for (const [x, y] of p.slice(1)) {
+            g.push(`G1 X${f3(y)} Y${f3(x)} F${FEED}`);
+          }
+          g.push("M5");
+          pos = p[p.length - 1];
+        }
+      }
+    }
+    g.push(`G1 X0 Y0 F${RAPID}`);
+    return g.join("\n") + "\n";
+  }
+
+  // Restored now: the mode, the shared text and the padding. Sheet and font
+  // wait for stickers.json, which lists what can be picked.
+  if (ui.mode) for (const el of document.getElementsByName("mode")) el.checked = el.value === ui.mode;
+  for (const el of document.getElementsByName("mode")) {
+    el.addEventListener("change", () => { ui.mode = mode(); saveUi(); syncMode(); });
+  }
+  syncMode();
+  persist($("#sttext"), "text");
+  persist(st.padding, "padding");
+
+  // Picking a sheet applies its default padding.
+  st.sheet.addEventListener("change", () => {
+    ui.sheet = sheet().name;
+    st.padding.value = ui.padding = String(sheet().padding ?? 0);
+    saveUi();
+    buildGrid();
+  });
+  st.font.addEventListener("change", () => { ui.font = st.font.value; saveUi(); });
+
+  // Built straight away from the copy saved last visit, so the sheet, font
+  // and boxes are in place on first paint; the board's copy then refreshes
+  // it (it only changes on an uploadfs).
+  function applyStickers(j) {
+    stickers = j;
+    st.sheet.innerHTML = "";
+    j.sheets.forEach((s, i) => st.sheet.add(new Option(s.name, i)));
+    st.font.innerHTML = "";
+    for (const name of Object.keys(j.fonts)) st.font.add(new Option(name, name));
+    // Saved picks only if stickers.json still has them (it's hand-edited).
+    const si = j.sheets.findIndex((s) => s.name === ui.sheet);
+    if (si >= 0) st.sheet.value = si;
+    if (ui.font in j.fonts) st.font.value = ui.font;
+    if (!("padding" in ui)) st.padding.value = sheet()?.padding ?? 0;
+    buildGrid();
+  }
+  if (ui.stickers) applyStickers(ui.stickers);
+  fetch("/stickers.json").then((r) => r.json()).then((j) => {
+    if (JSON.stringify(j) === JSON.stringify(ui.stickers)) return;
+    ui.stickers = j;
+    saveUi();
+    applyStickers(j);
+  }).catch(() => {});
+
+  st.addEventListener("submit", (e) => {
+    e.preventDefault();
+    const s = sheet();
+    if (!s) return;
+    const n = s.rows * s.columns;
+    const texts = mode() === "repeat"
+      ? Array(n).fill($("#sttext").value)
+      : [...$("#stgrid").querySelectorAll("textarea")].map((t) => t.value);
+    upload("#stbtn", "#stlog", async () => {
+      if (!texts.some((t) => t.trim())) throw 0;  // nothing to draw
+      await loadOpentype();
+      const font = await loadFont(st.font.value);
+      return stickersToGcode(font, s, texts, +st.padding.value);
+    });
+  });
+
+  // The board sends the current state the moment this connects (and again
+  // on every auto-reconnect). Until then the last one seen is shown, so the
+  // status and buttons are in place on first paint instead of popping in.
+  try { render(JSON.parse(localStorage.getItem("permablot-state"))); } catch {}
   const es = new EventSource("/events");
-  es.onmessage = (e) => render(JSON.parse(e.data));
-  fetch("/state").then((r) => r.json()).then(render).catch(() => {});
+  es.onmessage = (e) => {
+    try { localStorage.setItem("permablot-state", e.data); } catch {}
+    render(JSON.parse(e.data));
+  };
 </script>
 </body>
 </html>

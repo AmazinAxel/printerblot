@@ -7,9 +7,6 @@
 #define WIFI_SSID  ""
 #define WIFI_PASS  ""
 
-// mDNS name: reach the board at http://permablot.local/
-#define MDNS_NAME  "permablot"
-
 // Optional: transmit power (default WIFI_POWER_11dBm). Raise it, e.g. to
 // WIFI_POWER_19_5dBm, if the board is far from the router and drops off.
 // #define WIFI_TX_POWER WIFI_POWER_15dBm

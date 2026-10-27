@@ -9,18 +9,17 @@
 #define STEP_IDX   TIMER_0
 #define STEP_DIV   (TIMER_BASE_CLK / 1000000) // 80MHz APB / 80 = 1MHz
 
-static void (*s_handler)() = nullptr;
+static bool (*s_handler)() = nullptr;
 
 // IRAM_ATTR is the important part: without it this ISR lives in flash, and a
 // flash cache miss (which any WiFi or LittleFS activity can cause) would
 // stall step generation for tens of microseconds — visible as a stutter in
 // the plot. ESP_INTR_FLAG_IRAM below keeps the whole path resident.
 static bool IRAM_ATTR on_alarm(void *) {
-    if (s_handler) s_handler();
-    return false; // no task woken
+    return s_handler && s_handler();  // true = woke a task: yield on return
 }
 
-void steptimer_init(void (*handler)()) {
+void steptimer_init(bool (*handler)()) {
     s_handler = handler;
 
     timer_config_t cfg = {};

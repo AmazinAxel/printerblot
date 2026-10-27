@@ -1,0 +1,21 @@
+{
+  "fonts": {
+    "Iosevka": "https://amazinaxel.com/fonts/iosevka.ttf",
+    "Libron": "https://amazinaxel.com/fonts/libron.ttf",
+    "Monocraft": "https://amazinaxel.com/fonts/Monocraft.otf"
+  },
+  "sheets": [
+    {
+      "name": "6x1 Stickersheet",
+      "width": 68.5,
+      "height": 15,
+      "gapX": 2,
+      "gapY": 2,
+      "columns": 1,
+      "rows": 6,
+      "offsetX": 0,
+      "offsetY": 0,
+      "padding": 1.5
+    }
+  ]
+}

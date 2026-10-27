@@ -4,8 +4,8 @@
 #include "settings.h"   // work_area_max_{x,y}_mm, for soft limits
 
 // Ring buffer of planned blocks. head = next slot to write. tail = block
-// the stepper is currently executing (or about to). planned = oldest block
-// whose entry_speed can still be modified by lookahead (≥ tail).
+// the stepper is currently executing (or about to). planned = newest block
+// whose entry_speed is final; lookahead only re-plans from there (≥ tail).
 static plan_block_t block_buffer[PLANNER_BUFFER_SIZE];
 static volatile uint8_t buffer_head;
 static volatile uint8_t buffer_tail;
@@ -23,23 +23,19 @@ static int32_t last_machine_steps[2] = {0, 0};
 static float prev_unit_vec[2] = {0.0f, 0.0f};
 static bool  prev_unit_valid  = false;
 
-// Tunables (defaults; settings.cpp can overwrite)
-float planner_max_feedrate_mm_min    = DEFAULT_MAX_FEEDRATE_MM_MIN;
-float planner_max_rapid_mm_min       = DEFAULT_MAX_RAPID_MM_MIN;
-float planner_max_accel_mm_s2        = DEFAULT_MAX_ACCEL_MM_S2;
-float planner_motor_max_accel_mm_s2  = MOTOR_MAX_ACCEL_MM_S2;
-float planner_motor_max_rate_mm_min  = MOTOR_MAX_RATE_MM_MIN;
-float planner_junction_deviation_mm  = DEFAULT_JUNCTION_DEVIATION;
+// Tunables. Defaults and persistence live in settings.cpp.
+float planner_max_feedrate_mm_min;
+float planner_max_rapid_mm_min;
+float planner_max_accel_mm_s2;
+float planner_motor_max_accel_mm_s2;
+float planner_motor_max_rate_mm_min;
+float planner_junction_deviation_mm;
 
 static inline uint8_t next_index(uint8_t i) {
     return (i + 1) & (PLANNER_BUFFER_SIZE - 1);
 }
 static inline uint8_t prev_index(uint8_t i) {
     return (i + PLANNER_BUFFER_SIZE - 1) & (PLANNER_BUFFER_SIZE - 1);
-}
-
-void plan_init() {
-    plan_reset();
 }
 
 void plan_reset() {
@@ -205,7 +201,6 @@ static bool compute_trapezoid(plan_block_t *b) {
         b->accel_st = 0;
         b->accelerate_until = 0;
         b->decelerate_after = 0;
-        b->recalculate_flag = false;
         interrupts();
         return true;
     }
@@ -271,7 +266,6 @@ static bool compute_trapezoid(plan_block_t *b) {
     b->accel_st           = new_accel_st;
     b->accelerate_until   = new_accelerate_until;
     b->decelerate_after   = new_decelerate_after;
-    b->recalculate_flag   = false;
     interrupts();
     return true;
 }
@@ -315,8 +309,8 @@ static void planner_recalculate() {
 
     while (idx != buffer_planned) {
         uint8_t pidx = prev_index(idx);
-        if (pidx == (uint8_t)(buffer_tail - 1 + PLANNER_BUFFER_SIZE) % PLANNER_BUFFER_SIZE)
-            break;
+        // The plan pointer's own entry is final (see the forward pass).
+        if (pidx == buffer_planned) break;
         plan_block_t *cur  = &block_buffer[idx];
         plan_block_t *prev = &block_buffer[pidx];
 
@@ -335,7 +329,6 @@ static void planner_recalculate() {
 
         if (fabsf(new_entry - prev->entry_speed) > 1e-4f) {
             prev->entry_speed = new_entry;
-            prev->recalculate_flag = true;
         } else {
             // Entry didn't change; deeper blocks won't change either.
             break;
@@ -350,6 +343,13 @@ static void planner_recalculate() {
     // depends on the next block's entry; if we only re-run when cur's
     // entry changed, we miss the common case "block 2 arrived, so block 1
     // can now cruise through instead of decelerating to zero."
+    //
+    // It also advances the optimal-plan pointer (GRBL's rule): a block whose
+    // entry is accel-limited from its predecessor, or already at its
+    // junction/nominal cap, can never be planned faster by later blocks. Its
+    // entry is final, so the next call's passes start there instead of
+    // re-planning the whole buffer for every queued line.
+    uint8_t new_planned = buffer_planned;
     idx = buffer_planned;
     while (idx != buffer_head) {
         uint8_t nidx = next_index(idx);
@@ -362,6 +362,7 @@ static void planner_recalculate() {
             float v_max = sqrtf(v_reach_sq);
             if (nxt->entry_speed > v_max) {
                 nxt->entry_speed = v_max;
+                new_planned = nidx;
             }
         }
 
@@ -372,15 +373,23 @@ static void planner_recalculate() {
                            / (float)cur->step_event_count;
             if (nxt->entry_speed > v_exit) nxt->entry_speed = v_exit;
         }
+        if (nxt && nxt->entry_speed >= fminf(nxt->max_entry_speed, nxt->nominal_speed))
+            new_planned = nidx;
         idx = nidx;
     }
 
-    buffer_planned = buffer_tail;
+    // The stepper may have consumed blocks meanwhile; plan_discard_current_
+    // block() already moved the pointer off them, so never move it back.
+    noInterrupts();
+    uint8_t queued = (buffer_head - buffer_tail) & (PLANNER_BUFFER_SIZE - 1);
+    if (((new_planned - buffer_tail) & (PLANNER_BUFFER_SIZE - 1)) < queued)
+        buffer_planned = new_planned;
+    interrupts();
 }
 
 // ───────── soft limits ─────────
 
-bool planner_soft_limits_enabled = true;
+bool planner_soft_limits_enabled;  // default (on) in settings.cpp
 
 // Targets are machine coordinates (G92 offsets are already applied by the
 // caller), which is the frame the envelope is measured in.
@@ -390,7 +399,7 @@ bool planner_soft_limits_enabled = true;
 // must not be rejected because the arithmetic landed on 125.0000076. One
 // microstep is 1/80 mm, so half a microstep is comfortably below anything
 // mechanically meaningful while still catching real overruns.
-bool plan_target_in_bounds(float x, float y) {
+static bool target_in_bounds(float x, float y) {
     if (!planner_soft_limits_enabled) return true;
     const float tol = 0.5f / STEPS_PER_MM;
     return x >= -tol && y >= -tol &&
@@ -402,11 +411,11 @@ bool plan_target_in_bounds(float x, float y) {
 
 bool plan_buffer_line(float x_target, float y_target,
                       float feedrate_mm_min, bool rapid) {
-    // Back-pressure: caller should check plan_buffer_available() first.
+    // Never full in practice: the job feeder checks plan_buffer_available().
     if (next_index(buffer_head) == buffer_tail) return false;
 
-    // Soft limits. Every motion path (G0/G1, each arc segment, G28, and the
-    // job feeder) funnels through here, so this one check covers them all —
+    // Soft limits. Every motion path (G0/G1 from jobs, the return to origin)
+    // funnels through here, so this one check covers them all —
     // guarding the individual callers would be both longer and easy to miss
     // a path with.
     //
@@ -415,7 +424,7 @@ bool plan_buffer_line(float x_target, float y_target,
     // bad move with an error the caller reports. There are no limit switches,
     // so driving into the frame is a mechanical crash at up to 16000 mm/min —
     // the machine cannot detect or recover from it on its own.
-    if (!plan_target_in_bounds(x_target, y_target)) return false;
+    if (!target_in_bounds(x_target, y_target)) return false;
 
     float dx = x_target - last_pos[0];
     float dy = y_target - last_pos[1];
@@ -463,7 +472,6 @@ bool plan_buffer_line(float x_target, float y_target,
     b->entry_speed = 0.0f;         // will be set by recalculate()
     b->sync_cmd = SYNC_NONE;
     b->sync_arg = 0;
-    b->recalculate_flag = true;
 
     // Commit
     prev_unit_vec[0] = b->unit_vec[0];
@@ -498,7 +506,6 @@ bool plan_sync_command(uint8_t cmd, int32_t arg) {
     b->events_per_mm_q8 = 0;
     b->sync_cmd = cmd;
     b->sync_arg = arg;
-    b->recalculate_flag = false;
 
     // Sync blocks break the junction chain — there's no continuous motion
     // across them, so the next move starts from zero.

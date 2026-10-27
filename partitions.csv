@@ -1,11 +1,11 @@
 # XIAO ESP32-S3: 8MB flash.
-# Two 2MB app slots (OTA-capable layout, only app0 used today) and a ~3.5MB
-# LittleFS holding the web UI assets (pdf.js is ~1MB) plus the current job's
-# gcode.
+# One 1.25MB factory app (no OTA: nothing here updates over the air; the
+# firmware is ~800KB) and a ~6.7MB LittleFS holding the web UI and the
+# current job's gcode — everything else. The web UI pulls pdf.js and its
+# fonts from CDNs, so nearly all of it is job space. nvs fills the space up
+# to the app's required 64KB-aligned start. No coredump partition: nothing
+# reads panic dumps.
 # Name,   Type, SubType, Offset,   Size,     Flags
-nvs,      data, nvs,     0x9000,   0x5000,
-otadata,  data, ota,     0xe000,   0x2000,
-app0,     app,  ota_0,   0x10000,  0x200000,
-app1,     app,  ota_1,   0x210000, 0x200000,
-spiffs,   data, spiffs,  0x410000, 0x3E0000,
-coredump, data, coredump,0x7F0000, 0x10000,
+nvs,      data, nvs,     0x9000,   0x7000,
+app0,     app,  factory, 0x10000,  0x140000,
+spiffs,   data, spiffs,  0x150000, 0x6B0000,

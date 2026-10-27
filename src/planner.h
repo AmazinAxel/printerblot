@@ -3,15 +3,13 @@
 #include <Arduino.h>
 #include "config.h"
 
-// Commands that can be synchronized with the motion buffer. A sync command
-// block is a zero-distance entry in the planner that fires its side-effect
-// when the stepper reaches it. That way pen up/down and dwells happen at the
-// correct point in the motion stream, not prematurely from the main loop.
+// Commands synchronized with the motion buffer. A sync block is a
+// zero-distance entry in the planner that fires its side-effect when the
+// stepper reaches it, so pen up/down happens at the correct point in the
+// motion stream, not prematurely when the line is parsed.
 enum SyncCmd : uint8_t {
-    SYNC_NONE       = 0,
-    SYNC_SERVO      = 1,  // sync_arg = pulse width in µs
-    SYNC_DWELL      = 2,  // sync_arg = dwell ms
-    SYNC_SET_ENABLE = 3,  // sync_arg = 1 enable, 0 disable
+    SYNC_NONE  = 0,
+    SYNC_SERVO = 1,  // sync_arg = pulse width in µs
 };
 
 typedef struct {
@@ -47,28 +45,18 @@ typedef struct {
     // Synchronized side-effect (executed after this block's motion completes)
     uint8_t  sync_cmd;
     int32_t  sync_arg;
-
-    // Flag: block needs its trapezoid recomputed
-    bool recalculate_flag;
 } plan_block_t;
 
 
-void plan_init();
-void plan_reset();                          // flush buffer; call on soft reset
+void plan_reset();                          // flush buffer; init and soft reset
 bool plan_is_empty();
-uint8_t plan_buffer_available();            // slots free (for host flow control hints)
+uint8_t plan_buffer_available();            // free slots, for the job feeder
 
-// Linear Cartesian move. Returns true if queued; false if the buffer is full
-// OR the target is outside the soft-limit envelope.
-// feedrate is in mm/min (GRBL convention). 'rapid' uses the G0 feedrate cap.
+// Linear Cartesian move to machine coordinates. Returns true if queued; false
+// if the buffer is full OR the target is outside the soft-limit envelope
+// ($130/$131, when $20 is on). feedrate is in mm/min; 'rapid' uses the G0 cap.
 bool plan_buffer_line(float x_target_mm, float y_target_mm,
                       float feedrate_mm_min, bool rapid);
-
-// True if (x, y) — machine coordinates — is inside the work envelope
-// ($130/$131), or if soft limits are disabled. Callers use this to reject a
-// move *before* waiting on a planner slot, so an out-of-bounds line reports
-// an error instead of blocking.
-bool plan_target_in_bounds(float x_mm, float y_mm);
 
 // Soft-limit master switch ($20). On by default: there are no limit switches,
 // so an out-of-range move is a mechanical crash with nothing to stop it.
@@ -88,7 +76,7 @@ void plan_discard_current_block();
 // Planner's idea of where the tool is (mm, Cartesian). Updated on every queued
 // line so successive moves compute correct deltas.
 void plan_get_position(float *x, float *y);
-void plan_set_position(float x, float y);   // for G92
+void plan_set_position(float x, float y);   // re-anchor to the real position
 
 // Stream-side tunables (exposed for settings.cpp)
 extern float planner_max_feedrate_mm_min;

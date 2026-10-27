@@ -10,9 +10,9 @@ We're reusing the same hardware from [Blot](https://github.com/hackclub/blot), b
 
 ## How it's improved
 
-The webserver hosted on the ESP32-S3 boots as soon as you plug in the Blot. You can access it without remembering an IP, just go to `<your configured name>.local` in your web browser. You can upload a PDF there and it converts it to gcode in the browser, sending only the gcode to the Blot. That's stored in the device's flash, so you can reprint the same file without re-uploading it, and because the S3 has a second core you can upload one job while another prints so it's really fast and no connected computer is required.
+The webserver hosted on the ESP32-S3 boots as soon as you plug in the Blot. It announces itself as `permablot.local`, and a tiny proxy on my homelab makes it reachable over Tailscale at `http://alechomelab:8000`. You can upload a PDF there and it converts it to gcode in the browser, sending only the gcode to the Blot. That's stored in the device's flash, so you can reprint the same file without re-uploading it. The network runs on one of the S3's cores and printing on the other, so the page stays responsive mid-print and no connected computer is required — the web UI is the only way in (there's no USB input).
 
-The firmware also manages the hardware more carefully than the original with better motor handling, pen servo handling and networking radio which cut idle power and heat so you can leave the blot plugged in.
+The firmware is fully event-driven and manages the hardware more carefully than the original — motors and servo go quiet, the CPU slows and the radio dozes whenever it's idle — so you can leave the blot plugged in all year.
 
 ## Setup
 
@@ -23,7 +23,6 @@ Make `src/wifi_config.h` and put in your config:
 
 #define WIFI_SSID  ""
 #define WIFI_PASS  ""
-#define MDNS_NAME  "permablot"
 ```
 
 ```sh
@@ -31,4 +30,4 @@ pio run -t upload   # firmware
 pio run -t uploadfs # web stuff
 ```
 
-Then open `http://<MDNS name here>.local/` in your web browser!!
+Then open `http://alechomelab:8000/` (tailnet) or `http://permablot.local/` (LAN, if your machine resolves mDNS) in your web browser!!
